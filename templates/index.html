@@ -1,31 +1,3 @@
-#!/usr/bin/env python3
-"""Flask UI for CI/CD failure RCA."""
-
-from __future__ import annotations
-
-import os
-import sys
-from pathlib import Path
-from typing import Any
-
-from flask import Flask, jsonify, render_template, request
-
-ROOT_DIR = Path(__file__).resolve().parent
-SCRIPTS_DIR = ROOT_DIR / "scripts"
-if str(SCRIPTS_DIR) not in sys.path:
-    sys.path.insert(0, str(SCRIPTS_DIR))
-
-from env_loader import load_dotenv  # noqa: E402
-
-load_dotenv(ROOT_DIR / ".env")
-
-from agents.diagnosis_agent import diagnose_workflow_run
-
-
-app = Flask(__name__)
-
-
-PAGE = """
 <!doctype html>
 <html lang="en">
 <head>
@@ -206,12 +178,12 @@ PAGE = """
         <input name="github_token" type="password" placeholder="Uses GITHUB_TOKEN when blank">
       </label>
       <label>
-        Bedrock Model ID
+        Claude Model ID
         <input name="model_id" type="text" value="{{ model_id }}">
       </label>
       <label class="row">
         <input name="use_model" type="checkbox" checked>
-        Use Claude Sonnet through Bedrock
+        Use Claude Sonnet for RCA
       </label>
       <button id="submit" type="submit">Diagnose Failure</button>
     </form>
@@ -236,6 +208,63 @@ PAGE = """
     const statusEl = document.getElementById('status');
     const output = document.getElementById('output');
     const metrics = document.querySelectorAll('.metric strong');
+
+    function formatList(items) {
+      if (!Array.isArray(items) || items.length === 0) {
+        return '-';
+      }
+      return items.map((item) => `- ${item}`).join('\n');
+    }
+
+    function formatEvidence(items) {
+      if (!Array.isArray(items) || items.length === 0) {
+        return '-';
+      }
+      return items.map((item) => {
+        if (typeof item === 'string') {
+          return `- ${item}`;
+        }
+        const line = item.line ? `line ${item.line}: ` : '';
+        return `- ${line}${item.message || ''}`;
+      }).join('\n');
+    }
+
+    function formatInlineFixes(items) {
+      if (!Array.isArray(items) || items.length === 0) {
+        return '-';
+      }
+      return items.map((item) => {
+        if (typeof item === 'string') {
+          return `- ${item}`;
+        }
+        const parts = [
+          item.target ? `Target: ${item.target}` : null,
+          item.suggested_change ? `Fix: ${item.suggested_change}` : null,
+          item.rationale ? `Why: ${item.rationale}` : null
+        ].filter(Boolean);
+        return `- ${parts.join('\n  ') || '-'}`;
+      }).join('\n');
+    }
+
+    function formatRca(rca) {
+      const location = rca.failure_location || {};
+      const locationParts = [
+        location.job ? `Job: ${location.job}` : null,
+        location.log_file ? `Log file: ${location.log_file}` : null,
+        location.line ? `Line: ${location.line}` : null,
+        location.line_range ? `Failure block: ${location.line_range}` : null
+      ].filter(Boolean);
+
+      return [
+        `RCA Summary\n${rca.rca_summary || rca.root_cause || '-'}`,
+        `Failure Details\nStage: ${rca.failure_stage || '-'}\nType: ${rca.failure_type || rca.error_type || '-'}\nError code: ${rca.error_code || '-'}\nSeverity: ${rca.severity || '-'}\nConfidence: ${rca.confidence || '-'}`,
+        `Failure Location\n${locationParts.join('\n') || '-'}`,
+        `Evidence\n${formatEvidence(rca.evidence)}`,
+        `Remediation Steps\n${formatList(rca.remediation_steps)}`,
+        `Inline Fix Suggestions\n${formatInlineFixes(rca.inline_fix_suggestions || rca.inline_fixes || rca.suggested_fixes)}`,
+        `Verification\n${formatList(rca.verification_commands)}`
+      ].join('\n\n');
+    }
 
     form.addEventListener('submit', async (event) => {
       event.preventDefault();
@@ -265,7 +294,7 @@ PAGE = """
         metrics[0].textContent = data.run?.run_id || '-';
         metrics[1].textContent = data.signal_count ?? '-';
         metrics[2].textContent = data.failure_block_count ?? '-';
-        output.textContent = JSON.stringify(data.rca, null, 2);
+        output.textContent = formatRca(data.rca || {});
         statusEl.textContent = 'Complete';
         statusEl.className = 'status ok';
       } catch (error) {
@@ -278,33 +307,3 @@ PAGE = """
   </script>
 </body>
 </html>
-"""
-
-
-@app.get("/")
-def index() -> str:
-    model_id = os.getenv("ANTHROPIC_MODEL_ID") or os.getenv("BEDROCK_MODEL_ID") or "anthropic.claude-sonnet-4"
-    return render_template("index.html", model_id=model_id)
-
-
-@app.post("/api/diagnose")
-def diagnose() -> Any:
-    payload = request.get_json(silent=True) or {}
-    run_url = str(payload.get("run_url") or "").strip()
-    if not run_url:
-        return jsonify({"error": "GitHub Actions run URL is required."}), 400
-
-    try:
-        result = diagnose_workflow_run(
-            run_url=run_url,
-            token=str(payload.get("github_token") or "").strip() or None,
-            use_model=bool(payload.get("use_model", True)),
-            model_id=str(payload.get("model_id") or "").strip() or None,
-        )
-    except Exception as exc:  # noqa: BLE001 - return actionable UI errors.
-        return jsonify({"error": str(exc)}), 500
-    return jsonify(result)
-
-
-if __name__ == "__main__":
-    app.run(host=os.getenv("FLASK_HOST", "127.0.0.1"), port=int(os.getenv("FLASK_PORT", "5000")), debug=True)

@@ -15,20 +15,66 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import re
+import shutil
+import ssl
 import subprocess
 import sys
+import urllib.parse
+import urllib.request
 import zipfile
-from dataclasses import asdict, dataclass
+from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
 from db import LocalVectorDB
+from env_loader import load_dotenv
+
+
+load_dotenv()
 
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 DEFAULT_KAGGLE_DATASET_SLUG = "mirzayasirabdullah07/cicd-pipeline-failure-logs-dataset-for-aiops"
 DEFAULT_KAGGLE_DATASET_URL = f"https://www.kaggle.com/datasets/{DEFAULT_KAGGLE_DATASET_SLUG}"
+DEFAULT_HUGGINGFACE_DATASET_ID = "Snaseem2026/devops-incident-response"
+DEFAULT_HUGGINGFACE_DATASET_URL = f"https://huggingface.co/datasets/{DEFAULT_HUGGINGFACE_DATASET_ID}"
+DEFAULT_HUGGINGFACE_SPLITS = ("train", "validation", "test")
+DEFAULT_PATTERN_CONFIG_PATH = DEFAULT_DATA_DIR / "failure_signal_patterns.json"
+
+
+def compile_flags(flag_names: Iterable[str] | None) -> int:
+    flags = 0
+    for name in flag_names or []:
+        try:
+            flags |= getattr(re, str(name).upper())
+        except AttributeError as exc:
+            raise ValueError(f"Unsupported regex flag in {DEFAULT_PATTERN_CONFIG_PATH}: {name}") from exc
+    return flags
+
+
+def load_failure_pattern_config(path: Path = DEFAULT_PATTERN_CONFIG_PATH) -> dict[str, Any]:
+    if not path.exists():
+        raise FileNotFoundError(f"Missing failure pattern config: {path}")
+    with path.open("r", encoding="utf-8") as fh:
+        return json.load(fh)
+
+
+def compile_pattern_entry(entry: dict[str, Any]) -> re.Pattern[str]:
+    return re.compile(str(entry["pattern"]), compile_flags(entry.get("flags")))
+
+
+def compile_named_patterns(config: dict[str, Any], key: str) -> list[tuple[str, re.Pattern[str]]]:
+    patterns: list[tuple[str, re.Pattern[str]]] = []
+    for entry in config.get(key, []):
+        patterns.append((str(entry["name"]), compile_pattern_entry(entry)))
+    if not patterns:
+        raise ValueError(f"No patterns configured for {key} in {DEFAULT_PATTERN_CONFIG_PATH}")
+    return patterns
+
+
+PATTERN_CONFIG = load_failure_pattern_config()
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ISO_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s*")
@@ -40,39 +86,20 @@ GITHUB_COMMAND_RE = re.compile(r"^(?:##\[(?:debug|command|section|notice|warning
 DEBUG_RE = re.compile(r"^(?:debug\b|trace\b|verbose\b|##\[debug\]|::debug\b)", re.I)
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 LEADING_STEP_RE = re.compile(r"^\s*(?:Run|shell:|env:)\s+", re.I)
-FAILURE_BLOCK_END_RE = re.compile(
-    r"^(?:Post job cleanup|Complete job|Finishing:|##\[endgroup\]|::endgroup::|Cleaning up|Uploading artifacts)",
-    re.I,
-)
-
-
-FAILURE_BLOCK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("github_error_block", re.compile(r"(?:##\[error\]|::error\b)", re.I)),
-    ("traceback_block", re.compile(r"Traceback \(most recent call last\):", re.I)),
-    ("test_failure_block", re.compile(r"^(?:--- FAIL:|FAIL:|FAILED\s+|FAIL\b|Error Trace:)", re.I)),
-    ("process_exit_block", re.compile(r"\bprocess completed with exit code \d+\b", re.I)),
-    ("exception_block", re.compile(r"\b(?:Exception|Error|AssertionError|TypeError|ReferenceError):\s+", re.I)),
-    ("build_failure_block", re.compile(r"(?:make: \*\*\*|compilation failed|build failed|failed to compile)", re.I)),
-    ("dependency_failure_block", re.compile(r"(?:npm ERR!|pip install .* failed|could not find a version|module not found|go: .*: module)", re.I)),
-    ("container_failure_block", re.compile(r"(?:failed to solve:|Dockerfile parse error|Cannot connect to the Docker daemon|ImagePullBackOff|CrashLoopBackOff)", re.I)),
-    ("timeout_block", re.compile(r"\b(?:timed out|timeout|deadline exceeded|context deadline exceeded)\b", re.I)),
-]
-
-
-ERROR_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
-    ("github_annotation_error", re.compile(r"::error\b.*?(?:::|message=)(?P<message>.+)$", re.I)),
-    ("process_exit_code", re.compile(r"\bprocess completed with exit code (?P<exit_code>\d+)\b", re.I)),
-    ("exit_status", re.compile(r"\b(?:exit status|exited with code|exit code)\s+(?P<exit_code>\d+)\b", re.I)),
-    ("http_status", re.compile(r"\b(?:HTTP|status(?: code)?)\s*(?P<http_status>[45]\d{2})\b", re.I)),
-    ("errno", re.compile(r"\b(?P<errno>E(?:ACCES|PERM|NOENT|CONNRESET|CONNREFUSED|TIMEDOUT|HOSTUNREACH|ADDRINUSE|PIPE|INVAL|IO|EXIST|NOTDIR|ISDIR))\b")),
-    ("go_test_failure", re.compile(r"^(?:--- FAIL:|FAIL\b|panic:|fatal error:)", re.I)),
-    ("python_failure", re.compile(r"(?:Traceback \(most recent call last\):|AssertionError|pytest(?:.+)failed|FAILED\s+.+\.py)", re.I)),
-    ("javascript_failure", re.compile(r"(?:npm ERR!|yarn (?:run )?v?\d*.*error|pnpm ERR!|Jest.*failed|TypeError:|ReferenceError:)", re.I)),
-    ("docker_failure", re.compile(r"(?:docker: Error response from daemon|Cannot connect to the Docker daemon|denied: requested access|failed to solve:|image pull)", re.I)),
-    ("kubernetes_failure", re.compile(r"(?:Error from server \((?P<k8s_reason>[^)]+)\)|CrashLoopBackOff|ImagePullBackOff|CreateContainerConfigError|CreateContainerError|OOMKilled|DeadlineExceeded|Back-off restarting failed container)", re.I)),
-    ("timeout", re.compile(r"\b(?:timed out|timeout|deadline exceeded|context deadline exceeded)\b", re.I)),
-    ("generic_error", re.compile(r"\b(?:ERROR|FATAL|Exception|failed|failure|cannot|unable to)\b", re.I)),
-]
+FAILURE_BLOCK_END_RE = compile_pattern_entry(PATTERN_CONFIG["failure_block_end_pattern"])
+FAILURE_BLOCK_PATTERNS = compile_named_patterns(PATTERN_CONFIG, "failure_block_patterns")
+ERROR_PATTERNS = compile_named_patterns(PATTERN_CONFIG, "error_patterns")
+NOISE_PREFIXES = tuple(str(value).lower() for value in PATTERN_CONFIG.get("noise_prefixes", []))
+CLASSIFICATION_SIGNALS = {
+    str(key): tuple(str(token).lower() for token in values)
+    for key, values in PATTERN_CONFIG.get("classification_signals", {}).items()
+}
+ERROR_CODE_SIGNALS = {
+    str(key): tuple(str(token).lower() for token in values)
+    for key, values in PATTERN_CONFIG.get("error_code_signals", {}).items()
+}
+SEVERITY_SIGNALS = PATTERN_CONFIG.get("severity_signals", {})
+DATASET_FILE_SUFFIXES = {".csv", ".jsonl", ".ndjson", ".json"}
 
 
 @dataclass(frozen=True)
@@ -93,6 +120,9 @@ class ErrorSignal:
     signal_line: str
     context: str
     fingerprint: str
+    root_cause: str = ""
+    remediation_steps: tuple[str, ...] = field(default_factory=tuple)
+    source_url: str = ""
 
 
 @dataclass(frozen=True)
@@ -116,7 +146,7 @@ class FailureBlock:
 
 
 def load_json(path: Path) -> dict[str, Any]:
-    with path.open("r", encoding="utf-8") as fh:
+    with path.open("r", encoding="utf-8-sig") as fh:
         return json.load(fh)
 
 
@@ -151,6 +181,7 @@ def decode_log(raw: bytes) -> str:
 
 def clean_line(line: str) -> str:
     line = line.rstrip("\r\n")
+    line = line.lstrip("\ufeff")
     line = ANSI_RE.sub("", line)
     line = CONTROL_CHAR_RE.sub("", line)
     line = ISO_TS_RE.sub("", line)
@@ -166,20 +197,7 @@ def is_noise(line: str) -> bool:
     if DEBUG_RE.search(line) or GITHUB_COMMAND_RE.search(line):
         return True
     lowered = line.lower()
-    noise_prefixes = (
-        "requested labels:",
-        "job is waiting for",
-        "current runner version:",
-        "runner name:",
-        "runner group name:",
-        "operating system",
-        "runner image",
-        "prepare workflow directory",
-        "prepare all required actions",
-        "complete job name:",
-        "cleanup.",
-    )
-    return lowered.startswith(noise_prefixes)
+    return lowered.startswith(NOISE_PREFIXES)
 
 
 def section_by_line(raw_lines: list[str]) -> dict[int, str]:
@@ -393,27 +411,31 @@ def first_error_match(line: str) -> tuple[str, re.Match[str]] | None:
     return None
 
 
+def has_signal(line: str, signal_name: str) -> bool:
+    return any(token in line for token in CLASSIFICATION_SIGNALS.get(signal_name, ()))
+
+
 def classify_error(line: str, pattern_name: str) -> str:
     lowered = line.lower()
-    if pattern_name == "kubernetes_failure" or any(token in lowered for token in ("crashloopbackoff", "imagepullbackoff", "error from server", "pod ", "kubectl")):
+    if pattern_name == "kubernetes_failure" or has_signal(lowered, "kubernetes_error"):
         return "kubernetes_error"
-    if pattern_name == "docker_failure" or "docker" in lowered or "container" in lowered:
+    if pattern_name == "docker_failure" or has_signal(lowered, "container_error"):
         return "container_error"
-    if "permission denied" in lowered or "forbidden" in lowered or "unauthorized" in lowered or "eacces" in lowered or "eperm" in lowered:
+    if has_signal(lowered, "permission_error"):
         return "permission_error"
-    if "timed out" in lowered or "timeout" in lowered or "deadline exceeded" in lowered or "etimedout" in lowered:
+    if has_signal(lowered, "timeout"):
         return "timeout"
-    if any(token in lowered for token in ("connection refused", "connection reset", "temporary failure", "tls handshake", "no route to host", "could not resolve", "econnreset", "econnrefused")):
+    if has_signal(lowered, "network_error"):
         return "network_error"
-    if any(token in lowered for token in ("oomkilled", "out of memory", "no space left", "disk quota", "cannot allocate memory")):
+    if has_signal(lowered, "resource_error"):
         return "resource_error"
-    if pattern_name in {"go_test_failure", "python_failure"} or any(token in lowered for token in ("assertionerror", "--- fail:", "test failed", "failed tests", "expected", "actual")):
+    if pattern_name in {"go_test_failure", "python_failure"} or has_signal(lowered, "test_failure"):
         return "test_failure"
-    if pattern_name == "javascript_failure" or any(token in lowered for token in ("module not found", "cannot find module", "npm err!", "go: module", "no matching distribution")):
+    if pattern_name == "javascript_failure" or has_signal(lowered, "dependency_error"):
         return "dependency_error"
-    if any(token in lowered for token in ("syntax error", "compilation failed", "build failed", "make:", "compiler")):
+    if has_signal(lowered, "build_error"):
         return "build_error"
-    if any(token in lowered for token in ("yaml", "invalid configuration", "missing required", "secret not found", "unknown flag")):
+    if has_signal(lowered, "configuration_error"):
         return "configuration_error"
     if pattern_name in {"process_exit_code", "exit_status"}:
         return "process_exit"
@@ -433,16 +455,9 @@ def extract_error_code(line: str, match: re.Match[str], error_type: str) -> str:
         return f"K8S_{reason}"
 
     lowered = line.lower()
-    if "deadline exceeded" in lowered or "timed out" in lowered or "timeout" in lowered:
-        return "TIMEOUT"
-    if "oomkilled" in lowered or "out of memory" in lowered:
-        return "OOM"
-    if "permission denied" in lowered:
-        return "PERMISSION_DENIED"
-    if "connection refused" in lowered:
-        return "CONNECTION_REFUSED"
-    if "connection reset" in lowered:
-        return "CONNECTION_RESET"
+    for error_code, tokens in ERROR_CODE_SIGNALS.items():
+        if any(token in lowered for token in tokens):
+            return error_code
     return error_type.upper()
 
 
@@ -469,9 +484,12 @@ def error_code_for_line(
 
 def classify_severity(line: str, error_type: str, error_code: str) -> str:
     lowered = line.lower()
-    if any(token in lowered for token in ("fatal", "panic", "traceback", "oomkilled")):
+    high_tokens = tuple(str(token).lower() for token in SEVERITY_SIGNALS.get("high_tokens", []))
+    medium_types = set(str(token) for token in SEVERITY_SIGNALS.get("medium_error_types", []))
+    medium_prefixes = tuple(str(token) for token in SEVERITY_SIGNALS.get("medium_error_code_prefixes", []))
+    if any(token in lowered for token in high_tokens):
         return "high"
-    if error_code.startswith(("EXIT_", "HTTP_5")) or error_type in {"timeout", "resource_error"}:
+    if error_code.startswith(medium_prefixes) or error_type in medium_types:
         return "medium"
     return "low"
 
@@ -653,6 +671,7 @@ def signal_metadata(signal: ErrorSignal, run_metadata: dict[str, Any]) -> dict[s
         "error_code": signal.error_code,
         "severity": signal.severity,
         "html_url": run_metadata.get("html_url"),
+        "source_url": signal.source_url,
         "commit_sha": run_metadata.get("commit_sha"),
         "branch": run_metadata.get("branch"),
     }
@@ -731,7 +750,9 @@ def build_knowledge_graph(signals: list[ErrorSignal]) -> dict[str, Any]:
             "error_codes": sorted({signal.error_code for signal in signals if signal.error_code}),
             "error_types": sorted({signal.error_type for signal in signals if signal.error_type}),
             "failure_stages": sorted({signal.section for signal in signals if signal.section}),
+            "error_patterns": [name for name, _ in ERROR_PATTERNS],
             "failure_block_patterns": [name for name, _ in FAILURE_BLOCK_PATTERNS],
+            "pattern_config": str(DEFAULT_PATTERN_CONFIG_PATH),
         },
         "nodes": sorted(nodes.values(), key=lambda item: item["id"]),
         "edges": unique_edges,
@@ -748,10 +769,12 @@ def training_example(signal: ErrorSignal, run_metadata_lookup: dict[tuple[str, s
             f"Run status: {signal.status}",
             f"Branch: {run_metadata.get('branch') or 'unknown'}",
             f"Commit: {run_metadata.get('commit_sha') or 'unknown'}",
+            f"Source: {signal.source_url or run_metadata.get('html_url') or 'unknown'}",
             "Log excerpt:",
             signal.context,
         ]
     )
+    remediation_steps = list(signal.remediation_steps) if signal.remediation_steps else recommended_steps(signal.error_type)
 
     return {
         "id": signal.signal_id,
@@ -767,9 +790,9 @@ def training_example(signal: ErrorSignal, run_metadata_lookup: dict[tuple[str, s
             "root_cause_category": signal.error_type,
             "error_code": signal.error_code,
             "status": signal.status,
-            "summary": summarize_failure(signal),
+            "summary": signal.root_cause or summarize_failure(signal),
             "evidence": [signal.signal_line],
-            "recommended_next_steps": recommended_steps(signal.error_type),
+            "recommended_next_steps": remediation_steps,
         },
     }
 
@@ -859,8 +882,29 @@ def first_present(row: dict[str, Any], aliases: tuple[str, ...], default: str = 
     for alias in aliases:
         value = canonical_row.get(canonical_column(alias))
         if value is not None and str(value).strip():
-            return str(value).strip()
+            return text_value(value).strip()
     return default
+
+
+def text_value(value: Any) -> str:
+    if value is None:
+        return ""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict):
+        return " ".join(text_value(item) for item in value.values() if text_value(item))
+    if isinstance(value, list):
+        return " | ".join(text_value(item) for item in value if text_value(item))
+    return str(value)
+
+
+def list_value(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return [text_value(item).strip() for item in value if text_value(item).strip()]
+    text = text_value(value).strip()
+    return [text] if text else []
 
 
 def normalize_error_label(value: str, default: str = "unknown_error") -> str:
@@ -905,24 +949,120 @@ def normalize_severity(value: str, message: str, error_type: str, error_code: st
     return classify_severity(message, error_type, error_code)
 
 
+def is_huggingface_devops_incident(row: dict[str, Any]) -> bool:
+    canonical_keys = {canonical_column(str(key)) for key in row}
+    return {"incident_id", "root_cause", "symptoms"}.issubset(canonical_keys)
+
+
+def huggingface_record_to_signal(row: dict[str, Any], source_file: Path, row_number: int) -> ErrorSignal | None:
+    symptoms = list_value(row.get("symptoms"))
+    title = text_value(row.get("title")).strip()
+    description = text_value(row.get("description")).strip()
+    root_cause = text_value(row.get("root_cause")).strip()
+    resolution_steps = tuple(list_value(row.get("resolution_steps")))
+    incident_id = text_value(row.get("incident_id")).strip() or f"row-{row_number}"
+    severity_value = text_value(row.get("severity")).strip()
+    category = text_value(row.get("category")).strip()
+    environment = text_value(row.get("environment")).strip()
+    tags = list_value(row.get("tags"))
+    related_technologies = list_value(row.get("related_technologies"))
+
+    message = symptoms[0] if symptoms else description or title
+    if not message:
+        return None
+
+    conversation = [
+        text_value(item.get("message") if isinstance(item, dict) else item).strip()
+        for item in row.get("troubleshooting_conversation", [])
+        if text_value(item.get("message") if isinstance(item, dict) else item).strip()
+    ]
+    context_parts = [
+        f"Incident: {title}" if title else "",
+        f"Environment: {environment}" if environment else "",
+        f"Description: {description}" if description else "",
+        "Symptoms: " + " | ".join(symptoms) if symptoms else "",
+        "Troubleshooting: " + " | ".join(conversation[:8]) if conversation else "",
+        f"Root cause: {root_cause}" if root_cause else "",
+        "Resolution steps: " + " | ".join(resolution_steps) if resolution_steps else "",
+        "Tags: " + ", ".join(tags) if tags else "",
+        "Technologies: " + ", ".join(related_technologies) if related_technologies else "",
+    ]
+    context = "\n".join(part for part in context_parts if part)
+    match_payload = first_error_match(context) or first_error_match(message)
+    pattern_name = match_payload[0] if match_payload else "generic_error"
+    inferred_type = classify_error(context, pattern_name)
+    supplied_type = category if normalize_label(category) not in {"cicd", "cicdincident"} else ""
+    error_type = normalize_error_label(supplied_type, default=inferred_type)
+    if error_type in {"unknown_error", "cicd"}:
+        error_type = inferred_type if inferred_type != "unknown_error" else "process_exit"
+    error_code = normalize_error_code("", context, error_type)
+    severity = normalize_severity(severity_value, context, error_type, error_code)
+    stage = environment or category or "devops_incident"
+    fingerprint = fingerprint_error(context or message)
+    signal_id = stable_id("|".join([DEFAULT_HUGGINGFACE_DATASET_ID, str(source_file), incident_id, fingerprint]))
+
+    return ErrorSignal(
+        signal_id=signal_id,
+        run_id=incident_id,
+        repository=f"huggingface/{DEFAULT_HUGGINGFACE_DATASET_ID}",
+        workflow_name="huggingface_devops_incident_response",
+        job_name=category or "devops",
+        file_name=source_file.name,
+        line_number=row_number,
+        section=stage,
+        status="failure",
+        error_type=error_type,
+        error_code=error_code,
+        pattern_name="huggingface_devops_incident",
+        severity=severity,
+        signal_line=clean_line(message),
+        context=context,
+        fingerprint=fingerprint,
+        root_cause=root_cause,
+        remediation_steps=resolution_steps,
+        source_url=DEFAULT_HUGGINGFACE_DATASET_URL,
+    )
+
+
 def iter_dataset_files(dataset_path: Path) -> Iterable[Path]:
     if dataset_path.is_file():
-        yield dataset_path
+        if dataset_path.suffix.lower() in DATASET_FILE_SUFFIXES:
+            yield dataset_path
         return
 
     for suffix in ("*.csv", "*.jsonl", "*.ndjson", "*.json"):
         yield from sorted(dataset_path.rglob(suffix))
 
 
+def read_csv_rows_from_text(text_stream: Any) -> Iterable[dict[str, Any]]:
+    yield from csv.DictReader(text_stream)
+
+
+def read_json_rows_from_text(text: str) -> Iterable[dict[str, Any]]:
+    payload = json.loads(text)
+    if isinstance(payload, list):
+        for item in payload:
+            if isinstance(item, dict):
+                yield item
+    elif isinstance(payload, dict):
+        records = payload.get("records") or payload.get("data") or payload.get("rows")
+        if isinstance(records, list):
+            for item in records:
+                if isinstance(item, dict):
+                    yield item
+        else:
+            yield payload
+
+
 def read_dataset_file(path: Path) -> Iterable[dict[str, Any]]:
     suffix = path.suffix.lower()
     if suffix == ".csv":
         with path.open("r", encoding="utf-8-sig", newline="") as fh:
-            yield from csv.DictReader(fh)
+            yield from read_csv_rows_from_text(fh)
         return
 
     if suffix in {".jsonl", ".ndjson"}:
-        with path.open("r", encoding="utf-8") as fh:
+        with path.open("r", encoding="utf-8-sig") as fh:
             for line in fh:
                 line = line.strip()
                 if line:
@@ -932,23 +1072,15 @@ def read_dataset_file(path: Path) -> Iterable[dict[str, Any]]:
         return
 
     if suffix == ".json":
-        with path.open("r", encoding="utf-8") as fh:
-            payload = json.load(fh)
-        if isinstance(payload, list):
-            for item in payload:
-                if isinstance(item, dict):
-                    yield item
-        elif isinstance(payload, dict):
-            records = payload.get("records") or payload.get("data") or payload.get("rows")
-            if isinstance(records, list):
-                for item in records:
-                    if isinstance(item, dict):
-                        yield item
-            else:
-                yield payload
+        with path.open("r", encoding="utf-8-sig") as fh:
+            yield from read_json_rows_from_text(fh.read())
+        return
 
 
 def kaggle_record_to_signal(row: dict[str, Any], source_file: Path, row_number: int) -> ErrorSignal | None:
+    if is_huggingface_devops_incident(row):
+        return huggingface_record_to_signal(row, source_file, row_number)
+
     message = clean_line(first_present(row, KAGGLE_COLUMN_ALIASES["error_message"]))
     if not message:
         return None
@@ -987,6 +1119,7 @@ def kaggle_record_to_signal(row: dict[str, Any], source_file: Path, row_number: 
         signal_line=message,
         context=message,
         fingerprint=fingerprint,
+        source_url=DEFAULT_KAGGLE_DATASET_URL,
     )
 
 
@@ -1005,26 +1138,126 @@ def preprocess_kaggle_dataset(dataset_path: Path, max_records: int = 0) -> list[
 def download_kaggle_dataset(dataset_slug: str, data_dir: Path) -> Path:
     target_dir = data_dir / "kaggle" / dataset_slug.split("/")[-1]
     target_dir.mkdir(parents=True, exist_ok=True)
+    if any(path.stat().st_size > 0 for path in iter_dataset_files(target_dir)):
+        return target_dir
 
+    download_errors: list[str] = []
     try:
         import kagglehub  # type: ignore[import-not-found]
 
-        return Path(kagglehub.dataset_download(dataset_slug))
-    except ImportError:
-        command = [
-            sys.executable,
-            "-m",
-            "kaggle",
-            "datasets",
-            "download",
-            "-d",
-            dataset_slug,
-            "-p",
-            str(target_dir),
-            "--unzip",
-        ]
-        subprocess.run(command, check=True)
+        downloaded_path = Path(kagglehub.dataset_download(dataset_slug))
+        if downloaded_path.resolve() == target_dir.resolve():
+            return target_dir
+
+        for source_path in downloaded_path.rglob("*"):
+            if source_path.is_dir():
+                continue
+            relative_path = source_path.relative_to(downloaded_path)
+            destination_path = target_dir / relative_path
+            destination_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, destination_path)
         return target_dir
+    except ImportError as exc:
+        download_errors.append(f"kagglehub is not installed: {exc}")
+    except Exception as exc:  # noqa: BLE001 - try the Kaggle CLI fallback before failing.
+        download_errors.append(f"kagglehub failed: {exc}")
+
+    command = [
+        sys.executable,
+        "-m",
+        "kaggle",
+        "datasets",
+        "download",
+        "-d",
+        dataset_slug,
+        "-p",
+        str(target_dir),
+        "--unzip",
+    ]
+    completed = subprocess.run(command, text=True, capture_output=True, check=False)
+    if completed.returncode == 0:
+        return target_dir
+
+    cli_output = "\n".join(part for part in (completed.stdout.strip(), completed.stderr.strip()) if part)
+    download_errors.append(f"kaggle CLI failed: {cli_output or f'exit code {completed.returncode}'}")
+    raise RuntimeError("Unable to download Kaggle dataset. " + " | ".join(download_errors))
+
+
+def safe_dataset_name(dataset_id: str) -> str:
+    return re.sub(r"[^A-Za-z0-9._-]+", "_", dataset_id).strip("_")
+
+
+def fetch_url_text(url: str) -> str:
+    try:
+        request = urllib.request.Request(url, headers={"User-Agent": "smart-ci-remediation-agent"})
+        context = ssl._create_unverified_context() if os.getenv("ALLOW_INSECURE_DATASET_DOWNLOAD") == "1" else None
+        with urllib.request.urlopen(request, timeout=60, context=context) as response:
+            return response.read().decode("utf-8")
+    except Exception as urllib_exc:  # noqa: BLE001 - Windows cert store fallback below.
+        if os.name != "nt":
+            raise RuntimeError(f"Failed to fetch {url}: {urllib_exc}") from urllib_exc
+
+        escaped_url = url.replace("'", "''")
+        command = [
+            "powershell",
+            "-NoProfile",
+            "-Command",
+            (
+                "$ProgressPreference='SilentlyContinue'; "
+                f"(Invoke-WebRequest -UseBasicParsing -Uri '{escaped_url}').Content"
+            ),
+        ]
+        completed = subprocess.run(command, text=True, capture_output=True, check=False)
+        if completed.returncode == 0 and completed.stdout.strip():
+            return completed.stdout
+        raise RuntimeError(
+            f"Failed to fetch {url}: {urllib_exc}; PowerShell fallback failed: {completed.stderr.strip()}"
+        ) from urllib_exc
+
+
+def download_huggingface_dataset(dataset_id: str, data_dir: Path, splits: tuple[str, ...]) -> Path:
+    if not re.fullmatch(r"[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", dataset_id):
+        raise ValueError("Hugging Face dataset id must look like namespace/name")
+
+    target_dir = data_dir / "huggingface" / safe_dataset_name(dataset_id)
+    target_dir.mkdir(parents=True, exist_ok=True)
+    output_path = target_dir / "rows.jsonl"
+    if jsonl_file_has_records(output_path):
+        return target_dir
+
+    total_rows = 0
+    with output_path.open("w", encoding="utf-8") as fh:
+        for split in splits:
+            query = urllib.parse.urlencode(
+                {
+                    "dataset": dataset_id,
+                    "config": "default",
+                    "split": split,
+                    "offset": 0,
+                    "length": 100,
+                }
+            )
+            url = f"https://datasets-server.huggingface.co/rows?{query}"
+            payload = json.loads(fetch_url_text(url))
+            for item in payload.get("rows", []):
+                row = item.get("row")
+                if isinstance(row, dict):
+                    row["_hf_split"] = split
+                    row["_hf_dataset_id"] = dataset_id
+                    fh.write(json.dumps(row, sort_keys=True))
+                    fh.write("\n")
+                    total_rows += 1
+
+    if total_rows == 0:
+        raise RuntimeError(f"No rows downloaded from Hugging Face dataset {dataset_id}")
+    return target_dir
+
+
+def jsonl_file_has_records(path: Path) -> bool:
+    if not path.exists() or path.stat().st_size == 0:
+        return False
+    with path.open("r", encoding="utf-8-sig") as fh:
+        return any(line.strip() for line in fh)
 
 
 def resolve_kaggle_dataset_path(args: argparse.Namespace, data_dir: Path) -> Path | None:
@@ -1032,11 +1265,26 @@ def resolve_kaggle_dataset_path(args: argparse.Namespace, data_dir: Path) -> Pat
         return args.kaggle_dataset_path.resolve()
 
     default_path = data_dir / "kaggle" / args.kaggle_dataset_slug.split("/")[-1]
-    if default_path.exists():
+    if any(path.stat().st_size > 0 for path in iter_dataset_files(default_path)):
         return default_path
 
     if args.download_kaggle:
         return download_kaggle_dataset(args.kaggle_dataset_slug, data_dir)
+
+    return None
+
+
+def resolve_huggingface_dataset_path(args: argparse.Namespace, data_dir: Path) -> Path | None:
+    if args.huggingface_dataset_path:
+        return args.huggingface_dataset_path.resolve()
+
+    default_path = data_dir / "huggingface" / safe_dataset_name(args.huggingface_dataset_id)
+    if any(path.stat().st_size > 0 for path in iter_dataset_files(default_path)):
+        return default_path
+
+    if args.download_huggingface:
+        splits = tuple(split.strip() for split in args.huggingface_splits.split(",") if split.strip())
+        return download_huggingface_dataset(args.huggingface_dataset_id, data_dir, splits)
 
     return None
 
@@ -1088,6 +1336,26 @@ def parse_args() -> argparse.Namespace:
         default=0,
         help="Maximum Kaggle records to import. Use 0 for all records.",
     )
+    parser.add_argument(
+        "--huggingface-dataset-path",
+        type=Path,
+        help="Local file or directory for a Hugging Face DevOps incident dataset export.",
+    )
+    parser.add_argument(
+        "--huggingface-dataset-id",
+        default=DEFAULT_HUGGINGFACE_DATASET_ID,
+        help=f"Hugging Face dataset id. Defaults to {DEFAULT_HUGGINGFACE_DATASET_ID}.",
+    )
+    parser.add_argument(
+        "--download-huggingface",
+        action="store_true",
+        help="Download a Hugging Face DevOps incident dataset through the datasets-server rows API.",
+    )
+    parser.add_argument(
+        "--huggingface-splits",
+        default=",".join(DEFAULT_HUGGINGFACE_SPLITS),
+        help="Comma-separated Hugging Face splits to download.",
+    )
     return parser.parse_args()
 
 
@@ -1097,10 +1365,15 @@ def main() -> int:
     index_path = args.index or (data_dir / "index.json")
     vector_db_path = args.vector_db or (data_dir / "vector_store.sqlite")
     kaggle_path = resolve_kaggle_dataset_path(args, data_dir)
+    huggingface_path = resolve_huggingface_dataset_path(args, data_dir)
 
-    if not index_path.exists() and not kaggle_path:
+    if not index_path.exists() and not kaggle_path and not huggingface_path:
         print(f"Missing index: {index_path}", file=sys.stderr)
-        print("Run scripts/log-collector.py first or pass --kaggle-dataset-path / --download-kaggle.", file=sys.stderr)
+        print(
+            "Run scripts/log-collector.py first, pass --kaggle-dataset-path / --download-kaggle, "
+            "or pass --huggingface-dataset-path / --download-huggingface.",
+            file=sys.stderr,
+        )
         return 1
 
     index = load_json(index_path) if index_path.exists() else {"runs": []}
@@ -1151,6 +1424,24 @@ def main() -> int:
                     }
                 )
 
+    if huggingface_path:
+        if not huggingface_path.exists():
+            print(f"Hugging Face dataset path does not exist: {huggingface_path}", file=sys.stderr)
+        else:
+            huggingface_signals = preprocess_kaggle_dataset(huggingface_path, max_records=args.max_kaggle_records)
+            all_signals.extend(huggingface_signals)
+            for signal in huggingface_signals:
+                metadata = signal_metadata(signal, {})
+                metadata["doc_kind"] = "huggingface_devops_incident"
+                metadata["dataset_url"] = DEFAULT_HUGGINGFACE_DATASET_URL
+                vector_documents.append(
+                    {
+                        "document_id": f"huggingface_{signal.signal_id}",
+                        "text": signal.context,
+                        "metadata": metadata,
+                    }
+                )
+
     preprocessed_records = vector_documents
     signal_records = [asdict(signal) for signal in all_signals]
     block_records = [asdict(block) for block in all_blocks]
@@ -1176,6 +1467,8 @@ def main() -> int:
     print(f"Processed runs: {len(run_records)}; skipped missing zips: {skipped}")
     if kaggle_path:
         print(f"Kaggle dataset: {kaggle_path}")
+    if huggingface_path:
+        print(f"Hugging Face dataset: {huggingface_path}")
     print(f"Error signals: {signal_count}")
     print(f"Failure blocks: {block_count}")
     print(f"Preprocessed documents: {preprocessed_count}")

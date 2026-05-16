@@ -1,0 +1,279 @@
+{
+  "schema_version": 1,
+  "description": "Regex patterns, error codes, and classification signals used to extract CI/CD failure blocks from GitHub Actions logs and Kaggle failure records.",
+  "noise_prefixes": [
+    "requested labels:",
+    "job is waiting for",
+    "current runner version:",
+    "runner name:",
+    "runner group name:",
+    "operating system",
+    "runner image",
+    "prepare workflow directory",
+    "prepare all required actions",
+    "complete job name:",
+    "cleanup."
+  ],
+  "failure_block_end_pattern": {
+    "pattern": "^(?:Post job cleanup|Complete job|Finishing:|##\\[endgroup\\]|::endgroup::|Cleaning up|Uploading artifacts)",
+    "flags": [
+      "IGNORECASE"
+    ]
+  },
+  "failure_block_patterns": [
+    {
+      "name": "github_error_block",
+      "pattern": "(?:##\\[error\\]|::error\\b)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "traceback_block",
+      "pattern": "Traceback \\(most recent call last\\):",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "test_failure_block",
+      "pattern": "^(?:--- FAIL:|FAIL:|FAILED\\s+|FAIL\\b|Error Trace:)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "process_exit_block",
+      "pattern": "\\bprocess completed with exit code \\d+\\b",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "exception_block",
+      "pattern": "\\b(?:Exception|Error|AssertionError|TypeError|ReferenceError):\\s+",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "build_failure_block",
+      "pattern": "(?:make: \\*\\*\\*|compilation failed|build failed|failed to compile)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "dependency_failure_block",
+      "pattern": "(?:npm ERR!|pip install .* failed|could not find a version|module not found|go: .*: module)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "container_failure_block",
+      "pattern": "(?:failed to solve:|Dockerfile parse error|Cannot connect to the Docker daemon|ImagePullBackOff|CrashLoopBackOff)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "timeout_block",
+      "pattern": "\\b(?:timed out|timeout|deadline exceeded|context deadline exceeded)\\b",
+      "flags": [
+        "IGNORECASE"
+      ]
+    }
+  ],
+  "error_patterns": [
+    {
+      "name": "github_annotation_error",
+      "pattern": "::error\\b.*?(?:::|message=)(?P<message>.+)$",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "process_exit_code",
+      "pattern": "\\bprocess completed with exit code (?P<exit_code>\\d+)\\b",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "exit_status",
+      "pattern": "\\b(?:exit status|exited with code|exit code)\\s+(?P<exit_code>\\d+)\\b",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "http_status",
+      "pattern": "\\b(?:HTTP|status(?: code)?)\\s*(?P<http_status>[45]\\d{2})\\b",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "errno",
+      "pattern": "\\b(?P<errno>E(?:ACCES|PERM|NOENT|CONNRESET|CONNREFUSED|TIMEDOUT|HOSTUNREACH|ADDRINUSE|PIPE|INVAL|IO|EXIST|NOTDIR|ISDIR))\\b"
+    },
+    {
+      "name": "go_test_failure",
+      "pattern": "^(?:--- FAIL:|FAIL\\b|panic:|fatal error:)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "python_failure",
+      "pattern": "(?:Traceback \\(most recent call last\\):|AssertionError|pytest(?:.+)failed|FAILED\\s+.+\\.py)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "javascript_failure",
+      "pattern": "(?:npm ERR!|yarn (?:run )?v?\\d*.*error|pnpm ERR!|Jest.*failed|TypeError:|ReferenceError:)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "docker_failure",
+      "pattern": "(?:docker: Error response from daemon|Cannot connect to the Docker daemon|denied: requested access|failed to solve:|image pull)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "kubernetes_failure",
+      "pattern": "(?:Error from server \\((?P<k8s_reason>[^)]+)\\)|CrashLoopBackOff|ImagePullBackOff|CreateContainerConfigError|CreateContainerError|OOMKilled|DeadlineExceeded|Back-off restarting failed container)",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "timeout",
+      "pattern": "\\b(?:timed out|timeout|deadline exceeded|context deadline exceeded)\\b",
+      "flags": [
+        "IGNORECASE"
+      ]
+    },
+    {
+      "name": "generic_error",
+      "pattern": "\\b(?:ERROR|FATAL|Exception|failed|failure|cannot|unable to)\\b",
+      "flags": [
+        "IGNORECASE"
+      ]
+    }
+  ],
+  "classification_signals": {
+    "kubernetes_error": [
+      "crashloopbackoff",
+      "imagepullbackoff",
+      "error from server",
+      "pod ",
+      "kubectl"
+    ],
+    "container_error": [
+      "docker",
+      "container"
+    ],
+    "permission_error": [
+      "permission denied",
+      "forbidden",
+      "unauthorized",
+      "eacces",
+      "eperm"
+    ],
+    "timeout": [
+      "timed out",
+      "timeout",
+      "deadline exceeded",
+      "etimedout"
+    ],
+    "network_error": [
+      "connection refused",
+      "connection reset",
+      "temporary failure",
+      "tls handshake",
+      "no route to host",
+      "could not resolve",
+      "econnreset",
+      "econnrefused"
+    ],
+    "resource_error": [
+      "oomkilled",
+      "out of memory",
+      "no space left",
+      "disk quota",
+      "cannot allocate memory"
+    ],
+    "test_failure": [
+      "assertionerror",
+      "--- fail:",
+      "test failed",
+      "failed tests",
+      "expected",
+      "actual"
+    ],
+    "dependency_error": [
+      "module not found",
+      "cannot find module",
+      "npm err!",
+      "go: module",
+      "no matching distribution"
+    ],
+    "build_error": [
+      "syntax error",
+      "compilation failed",
+      "build failed",
+      "make:",
+      "compiler"
+    ],
+    "configuration_error": [
+      "yaml",
+      "invalid configuration",
+      "missing required",
+      "secret not found",
+      "unknown flag"
+    ]
+  },
+  "error_code_signals": {
+    "TIMEOUT": [
+      "deadline exceeded",
+      "timed out",
+      "timeout"
+    ],
+    "OOM": [
+      "oomkilled",
+      "out of memory"
+    ],
+    "PERMISSION_DENIED": [
+      "permission denied"
+    ],
+    "CONNECTION_REFUSED": [
+      "connection refused"
+    ],
+    "CONNECTION_RESET": [
+      "connection reset"
+    ]
+  },
+  "severity_signals": {
+    "high_tokens": [
+      "fatal",
+      "panic",
+      "traceback",
+      "oomkilled"
+    ],
+    "medium_error_types": [
+      "timeout",
+      "resource_error"
+    ],
+    "medium_error_code_prefixes": [
+      "EXIT_",
+      "HTTP_5"
+    ]
+  }
+}

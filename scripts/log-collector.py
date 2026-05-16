@@ -22,6 +22,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+from env_loader import load_dotenv
+
+
+load_dotenv()
 
 DEFAULT_REPO = "kubernetes/kubernetes"
 DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
@@ -87,7 +91,7 @@ def safe_repo_name(repo: str) -> str:
 def load_json(path: Path, default: dict[str, Any]) -> dict[str, Any]:
     if not path.exists():
         return default
-    with path.open("r", encoding="utf-8") as fh:
+    with path.open("r", encoding="utf-8-sig") as fh:
         return json.load(fh)
 
 

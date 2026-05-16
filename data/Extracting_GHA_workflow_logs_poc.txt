@@ -36,3 +36,26 @@ Do the below modification for existing log-collector and pre-processing code imp
 5. Add code for model training for model anthropic.claude-sonnet-4
 
 6. Add code for flask app, UI page for user input and returning the RCA output from model
+
+
+# Add the missing requirements Prompt
+
+Analyse the existing code and add the code changes to address the below missing things in the existing code implementation:
+
+1. Add the code for downloading the CI/CD failure dataset from kaggle_path:"mirzayasirabdullah07/cicd-pipeline-failure-logs-dataset-for-aiops" in scripts/train-claude-sonnet.py befor model training if not present
+
+2. Add the .env file for storing the model API key (sk-b1e8bd06bce84f2ebd48cc) for using anthropic.claude-sonnet-4 model and GitHub access token.
+
+3. Store the regex patterns, different error codes and signals in a file to extract the failure blocks from the collected log
+
+4. Train the model over CI/CD failure dataset for 5 iterations
+
+5. Check if the pre-processing pipeline is fine for pre-processing failed CI log file
+ 
+6. Add the template for UI page for the flask app
+
+7. Check the code is perfect for below flow:
+
+Training model: Download the CI/CD failure dataset -> Train model over the CI/CD failure dataset with failure/ error columns for 5 epochs -> Populate the error knowledge graph
+
+Test model/ user interaction: Take the failed workflow run URL from the user -> Fetch the workflow log by calling the GitHub REST API -> save the log file in .zip on local file system -> Pre-process the log data to extract the failure block -> Supply the error block to the model for RCA -> Return the RCA report to the user   
