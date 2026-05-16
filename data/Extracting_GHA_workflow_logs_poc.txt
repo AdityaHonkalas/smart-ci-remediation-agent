@@ -13,3 +13,26 @@ Generate code implementation for below stages:
 5. Build the training dataset from the pre-processed log data. Goal is to produce labelled error-> error class pairs for training a model.
 
 6. Store the log data into the vectorDB for sematic retrieval.
+
+
+Modification in the current log collector and datapre-processing:
+
+Do the below modification for existing log-collector and pre-processing code implmentation:
+
+1. Use https://www.kaggle.com/datasets/mirzayasirabdullah07/cicd-pipeline-failure-logs-dataset-for-aiops CI/CD failure dataset.
+
+2. Modify the code in scripts/log-collector.py to extract the log from the user provided GitHub Action workflow run URL https://github.com/{OWNER}/{REPO}/actions/runs/{run_id}.
+   Add OR modify python functions for:
+   - Fetching the CI logs by calling the GitHub REST API
+   - Archiving the downloaded log file into .zip and store metadata for path file in json format under the data/
+
+3. Add the regex pattern for extracting the failure blocks while pre-processing the logs.
+
+4. Modify the code in scripts/pre-processing-pipeline.py for:
+   - Pre-processing the CI/CD failure dataset for model training with the error specific columns e.g. failure_stage failure_type, error_code, error_message, severity for training a model
+   - Creating a knowledge graph for error codes, singals and error types and save in json files that can be used for filtering the logs to extract the error blocks
+   - Pre-processing pipeline functions for extracting the failure block from the collected log by decompressing .zip file, decoding, removing debug statements/ verbosity lines, applying the regex patterns and knowledge graph for filtering the error specific data
+ 
+5. Add code for model training for model anthropic.claude-sonnet-4
+
+6. Add code for flask app, UI page for user input and returning the RCA output from model

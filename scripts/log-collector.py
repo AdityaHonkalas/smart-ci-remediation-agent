@@ -8,6 +8,7 @@ runs and writes an index file with enough metadata for later RCA stages.
 from __future__ import annotations
 
 import argparse
+import io
 import json
 import os
 import sys
@@ -15,6 +16,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+import zipfile
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
@@ -46,6 +48,38 @@ def normalize_repo(repo: str) -> str:
     return repo
 
 
+def parse_workflow_run_url(run_url: str) -> WorkflowRunRef:
+    """Parse https://github.com/{owner}/{repo}/actions/runs/{run_id}."""
+    parsed = urllib.parse.urlparse(run_url.strip())
+    if parsed.netloc.lower() not in {"github.com", "www.github.com"}:
+        raise ValueError("Workflow run URL must be hosted on github.com")
+
+    parts = [part for part in parsed.path.split("/") if part]
+    if len(parts) < 5 or parts[2:4] != ["actions", "runs"]:
+        raise ValueError(
+            "Workflow run URL must look like https://github.com/{OWNER}/{REPO}/actions/runs/{run_id}"
+        )
+
+    try:
+        run_id = int(parts[4])
+    except ValueError as exc:
+        raise ValueError(f"Invalid workflow run id in URL: {parts[4]}") from exc
+
+    run_attempt = None
+    if len(parts) >= 7 and parts[5] == "attempts":
+        try:
+            run_attempt = int(parts[6])
+        except ValueError as exc:
+            raise ValueError(f"Invalid workflow run attempt in URL: {parts[6]}") from exc
+
+    return WorkflowRunRef(
+        repository=f"{parts[0]}/{parts[1]}",
+        run_id=run_id,
+        run_attempt=run_attempt,
+        html_url=run_url.strip(),
+    )
+
+
 def safe_repo_name(repo: str) -> str:
     return repo.replace("/", "_").replace(".", "_")
 
@@ -71,6 +105,15 @@ class DownloadResult:
     zip_path: Path | None
     size_bytes: int
     error: str | None = None
+    source_format: str = "github_zip"
+
+
+@dataclass(frozen=True)
+class WorkflowRunRef:
+    repository: str
+    run_id: int
+    run_attempt: int | None = None
+    html_url: str | None = None
 
 
 class GitHubActionsClient:
@@ -144,6 +187,15 @@ class GitHubActionsClient:
         return url
 
 
+def get_workflow_run(
+    client: GitHubActionsClient,
+    repo: str,
+    run_id: int,
+) -> dict[str, Any]:
+    """Fetch a single workflow run by id through the GitHub REST API."""
+    return client.request_json(f"/repos/{repo}/actions/runs/{run_id}")
+
+
 def list_failed_runs(
     client: GitHubActionsClient,
     repo: str,
@@ -176,6 +228,13 @@ def list_failed_runs(
                 break
 
     return runs
+
+
+def workflow_run_log_url(client: GitHubActionsClient, repo: str, run: dict[str, Any]) -> str:
+    """Return the REST API URL that downloads a workflow run log archive."""
+    if run.get("logs_url"):
+        return str(run["logs_url"])
+    return client._build_url(f"/repos/{repo}/actions/runs/{run['id']}/logs")
 
 
 def list_jobs_for_run(
@@ -218,6 +277,38 @@ def list_jobs_for_run(
     return jobs
 
 
+def ensure_zip_archive(
+    payload: bytes,
+    run: dict[str, Any],
+    repo: str,
+) -> tuple[bytes, str]:
+    """Keep GitHub zip archives as-is, or wrap raw log bytes into a zip."""
+    buffer = io.BytesIO(payload)
+    if zipfile.is_zipfile(buffer):
+        return payload, "github_zip"
+
+    output = io.BytesIO()
+    run_id = run.get("id", "unknown")
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"{safe_repo_name(repo)}_run-{run_id}.log", payload)
+        archive.writestr(
+            "metadata.json",
+            json.dumps(
+                {
+                    "repository": repo,
+                    "run_id": run_id,
+                    "workflow_name": run.get("name"),
+                    "html_url": run.get("html_url"),
+                    "created_at": run.get("created_at"),
+                    "wrapped_at": utc_now(),
+                },
+                indent=2,
+                sort_keys=True,
+            ),
+        )
+    return output.getvalue(), "wrapped_raw_log"
+
+
 def download_run_zip(
     client: GitHubActionsClient,
     repo: str,
@@ -234,13 +325,14 @@ def download_run_zip(
         return DownloadResult(zip_path=zip_path, size_bytes=zip_path.stat().st_size)
 
     try:
-        archive_bytes = client.download_bytes(run["logs_url"])
+        archive_bytes = client.download_bytes(workflow_run_log_url(client, repo, run))
     except Exception as exc:  # noqa: BLE001 - store the per-run failure in index.json.
         return DownloadResult(zip_path=None, size_bytes=0, error=str(exc))
 
+    archive_bytes, source_format = ensure_zip_archive(archive_bytes, run, repo)
     output_dir.mkdir(parents=True, exist_ok=True)
     zip_path.write_bytes(archive_bytes)
-    return DownloadResult(zip_path=zip_path, size_bytes=len(archive_bytes))
+    return DownloadResult(zip_path=zip_path, size_bytes=len(archive_bytes), source_format=source_format)
 
 
 def compact_run_metadata(
@@ -276,9 +368,23 @@ def compact_run_metadata(
         "jobs": jobs,
         "zip_path": zip_path,
         "zip_size_bytes": download.size_bytes,
+        "zip_source_format": download.source_format,
         "download_error": download.error,
         "collected_at": utc_now(),
     }
+
+
+def write_run_metadata_sidecar(data_dir: Path, record: dict[str, Any]) -> dict[str, Any]:
+    repo = str(record["repository"])
+    run_id = record.get("run_id")
+    attempt = record.get("run_attempt") or 1
+    metadata_path = data_dir / "metadata" / safe_repo_name(repo) / f"run-{run_id}_attempt-{attempt}.json"
+    relative_metadata_path = metadata_path.resolve().relative_to(data_dir.resolve()).as_posix()
+
+    updated_record = dict(record)
+    updated_record["metadata_path"] = relative_metadata_path
+    write_json(metadata_path, updated_record)
+    return updated_record
 
 
 def upsert_index(index_path: Path, repo: str, run_records: list[dict[str, Any]]) -> None:
@@ -327,6 +433,11 @@ def upsert_index(index_path: Path, repo: str, run_records: list[dict[str, Any]])
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Collect failed GitHub Actions logs.")
     parser.add_argument(
+        "--run-url",
+        help="GitHub Actions workflow run URL, e.g. https://github.com/{OWNER}/{REPO}/actions/runs/{run_id}.",
+    )
+    parser.add_argument("--run-id", type=int, help="Specific workflow run id to collect from --repo.")
+    parser.add_argument(
         "--repo",
         default=DEFAULT_REPO,
         help="GitHub owner/repo or repository URL. Defaults to kubernetes/kubernetes.",
@@ -365,23 +476,31 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> int:
     args = parse_args()
-    repo = normalize_repo(args.repo)
+    run_ref = parse_workflow_run_url(args.run_url) if args.run_url else None
+    repo = run_ref.repository if run_ref else normalize_repo(args.repo)
     data_dir = args.data_dir.resolve()
     log_dir = data_dir / "logs" / safe_repo_name(repo)
     index_path = data_dir / args.index_name
 
     client = GitHubActionsClient(token=args.token)
-    print(f"Scanning failed GitHub Actions runs for {repo}...")
-    runs = list_failed_runs(
-        client=client,
-        repo=repo,
-        limit=args.limit,
-        per_page=args.per_page,
-        max_pages=args.max_pages,
-        branch=args.branch,
-        workflow=args.workflow,
-        include_cancelled=args.include_cancelled,
-    )
+    if run_ref:
+        print(f"Fetching GitHub Actions run {run_ref.run_id} for {repo}...")
+        runs = [get_workflow_run(client=client, repo=repo, run_id=run_ref.run_id)]
+    elif args.run_id:
+        print(f"Fetching GitHub Actions run {args.run_id} for {repo}...")
+        runs = [get_workflow_run(client=client, repo=repo, run_id=args.run_id)]
+    else:
+        print(f"Scanning failed GitHub Actions runs for {repo}...")
+        runs = list_failed_runs(
+            client=client,
+            repo=repo,
+            limit=args.limit,
+            per_page=args.per_page,
+            max_pages=args.max_pages,
+            branch=args.branch,
+            workflow=args.workflow,
+            include_cancelled=args.include_cancelled,
+        )
 
     if not runs:
         print("No failed workflow runs found with the supplied filters.")
@@ -395,7 +514,8 @@ def main() -> int:
 
         jobs = list_jobs_for_run(client, repo=repo, run_id=run_id, max_pages=args.job_pages)
         download = download_run_zip(client, repo=repo, run=run, output_dir=log_dir, overwrite=args.overwrite)
-        records.append(compact_run_metadata(repo, run, jobs, download, data_dir))
+        record = compact_run_metadata(repo, run, jobs, download, data_dir)
+        records.append(write_run_metadata_sidecar(data_dir, record))
 
         if download.error:
             print(f"  log download failed: {download.error}", file=sys.stderr)

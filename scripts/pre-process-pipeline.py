@@ -12,9 +12,11 @@ Pipeline outputs:
 from __future__ import annotations
 
 import argparse
+import csv
 import hashlib
 import json
 import re
+import subprocess
 import sys
 import zipfile
 from dataclasses import asdict, dataclass
@@ -25,6 +27,8 @@ from db import LocalVectorDB
 
 
 DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
+DEFAULT_KAGGLE_DATASET_SLUG = "mirzayasirabdullah07/cicd-pipeline-failure-logs-dataset-for-aiops"
+DEFAULT_KAGGLE_DATASET_URL = f"https://www.kaggle.com/datasets/{DEFAULT_KAGGLE_DATASET_SLUG}"
 
 ANSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
 ISO_TS_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z\s*")
@@ -36,6 +40,23 @@ GITHUB_COMMAND_RE = re.compile(r"^(?:##\[(?:debug|command|section|notice|warning
 DEBUG_RE = re.compile(r"^(?:debug\b|trace\b|verbose\b|##\[debug\]|::debug\b)", re.I)
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 LEADING_STEP_RE = re.compile(r"^\s*(?:Run|shell:|env:)\s+", re.I)
+FAILURE_BLOCK_END_RE = re.compile(
+    r"^(?:Post job cleanup|Complete job|Finishing:|##\[endgroup\]|::endgroup::|Cleaning up|Uploading artifacts)",
+    re.I,
+)
+
+
+FAILURE_BLOCK_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
+    ("github_error_block", re.compile(r"(?:##\[error\]|::error\b)", re.I)),
+    ("traceback_block", re.compile(r"Traceback \(most recent call last\):", re.I)),
+    ("test_failure_block", re.compile(r"^(?:--- FAIL:|FAIL:|FAILED\s+|FAIL\b|Error Trace:)", re.I)),
+    ("process_exit_block", re.compile(r"\bprocess completed with exit code \d+\b", re.I)),
+    ("exception_block", re.compile(r"\b(?:Exception|Error|AssertionError|TypeError|ReferenceError):\s+", re.I)),
+    ("build_failure_block", re.compile(r"(?:make: \*\*\*|compilation failed|build failed|failed to compile)", re.I)),
+    ("dependency_failure_block", re.compile(r"(?:npm ERR!|pip install .* failed|could not find a version|module not found|go: .*: module)", re.I)),
+    ("container_failure_block", re.compile(r"(?:failed to solve:|Dockerfile parse error|Cannot connect to the Docker daemon|ImagePullBackOff|CrashLoopBackOff)", re.I)),
+    ("timeout_block", re.compile(r"\b(?:timed out|timeout|deadline exceeded|context deadline exceeded)\b", re.I)),
+]
 
 
 ERROR_PATTERNS: list[tuple[str, re.Pattern[str]]] = [
@@ -71,6 +92,26 @@ class ErrorSignal:
     severity: str
     signal_line: str
     context: str
+    fingerprint: str
+
+
+@dataclass(frozen=True)
+class FailureBlock:
+    block_id: str
+    run_id: str
+    repository: str
+    workflow_name: str
+    job_name: str
+    file_name: str
+    start_line: int
+    end_line: int
+    failure_stage: str
+    failure_type: str
+    error_code: str
+    error_message: str
+    severity: str
+    matched_pattern: str
+    text: str
     fingerprint: str
 
 
@@ -248,6 +289,102 @@ def extract_signals(
     return signals
 
 
+def extract_failure_blocks(
+    lines: list[tuple[int, str]],
+    sections: dict[int, str],
+    run_metadata: dict[str, Any],
+    member_name: str,
+    context_lines: int,
+    max_blocks: int,
+) -> list[FailureBlock]:
+    blocks: list[FailureBlock] = []
+    seen_fingerprints: set[str] = set()
+    job_name = infer_job_name(member_name, run_metadata)
+
+    for index, (line_number, line) in enumerate(lines):
+        block_match = first_failure_block_match(line)
+        if not block_match:
+            continue
+
+        matched_pattern, _ = block_match
+        start_index = max(index - max(1, context_lines // 2), 0)
+        end_index = find_failure_block_end(lines, index, context_lines)
+        block_lines = lines[start_index:end_index]
+        if not block_lines:
+            continue
+
+        text = "\n".join(f"{number}: {content}" for number, content in block_lines)
+        fingerprint = fingerprint_error(text)
+        if fingerprint in seen_fingerprints:
+            continue
+        seen_fingerprints.add(fingerprint)
+
+        signal_match = first_error_match(line)
+        error_type = classify_error(line, signal_match[0] if signal_match else matched_pattern)
+        error_code = error_code_for_line(line, signal_match, error_type)
+        severity = classify_severity(line, error_type, error_code)
+        block_id = stable_id(
+            "|".join(
+                [
+                    str(run_metadata.get("run_id")),
+                    str(run_metadata.get("run_attempt")),
+                    member_name,
+                    str(block_lines[0][0]),
+                    str(block_lines[-1][0]),
+                    fingerprint,
+                ]
+            )
+        )
+
+        blocks.append(
+            FailureBlock(
+                block_id=block_id,
+                run_id=str(run_metadata.get("run_id")),
+                repository=run_metadata.get("repository", "unknown"),
+                workflow_name=run_metadata.get("workflow_name") or "unknown",
+                job_name=job_name,
+                file_name=member_name,
+                start_line=block_lines[0][0],
+                end_line=block_lines[-1][0],
+                failure_stage=sections.get(line_number, "root"),
+                failure_type=error_type,
+                error_code=error_code,
+                error_message=line,
+                severity=severity,
+                matched_pattern=matched_pattern,
+                text=text,
+                fingerprint=fingerprint,
+            )
+        )
+
+        if len(blocks) >= max_blocks:
+            break
+
+    return blocks
+
+
+def first_failure_block_match(line: str) -> tuple[str, re.Match[str]] | None:
+    for pattern_name, pattern in FAILURE_BLOCK_PATTERNS:
+        match = pattern.search(line)
+        if match:
+            return pattern_name, match
+    return None
+
+
+def find_failure_block_end(
+    lines: list[tuple[int, str]],
+    start_index: int,
+    context_lines: int,
+) -> int:
+    max_end = min(len(lines), start_index + max(context_lines * 3, 12))
+    for index in range(start_index + 1, max_end):
+        if FAILURE_BLOCK_END_RE.search(lines[index][1]):
+            return index
+        if index > start_index + 2 and first_failure_block_match(lines[index][1]):
+            return index
+    return max_end
+
+
 def first_error_match(line: str) -> tuple[str, re.Match[str]] | None:
     for pattern_name, pattern in ERROR_PATTERNS:
         match = pattern.search(line)
@@ -309,6 +446,27 @@ def extract_error_code(line: str, match: re.Match[str], error_type: str) -> str:
     return error_type.upper()
 
 
+def error_code_for_line(
+    line: str,
+    match_payload: tuple[str, re.Match[str]] | None,
+    error_type: str,
+) -> str:
+    if match_payload:
+        return extract_error_code(line, match_payload[1], error_type)
+
+    lowered = line.lower()
+    exit_code_match = re.search(r"\b(?:exit code|exit status)\s+(\d+)\b", lowered)
+    if exit_code_match:
+        return f"EXIT_{exit_code_match.group(1)}"
+    http_status_match = re.search(r"\b([45]\d{2})\b", lowered)
+    if http_status_match and any(token in lowered for token in ("http", "status", "response")):
+        return f"HTTP_{http_status_match.group(1)}"
+    errno_match = re.search(r"\b(E[A-Z0-9_]+)\b", line)
+    if errno_match:
+        return errno_match.group(1)
+    return extract_error_code(line, re.match(r".*", line) or re.search(r".*", line), error_type)
+
+
 def classify_severity(line: str, error_type: str, error_code: str) -> str:
     lowered = line.lower()
     if any(token in lowered for token in ("fatal", "panic", "traceback", "oomkilled")):
@@ -344,15 +502,16 @@ def process_zip(
     max_signals_per_log: int,
     chunk_lines: int,
     chunk_overlap: int,
-) -> tuple[list[ErrorSignal], list[dict[str, Any]]]:
+) -> tuple[list[ErrorSignal], list[dict[str, Any]], list[FailureBlock]]:
     signals: list[ErrorSignal] = []
     documents: list[dict[str, Any]] = []
+    failure_blocks: list[FailureBlock] = []
 
     try:
         archive = zipfile.ZipFile(zip_path)
     except zipfile.BadZipFile as exc:
         print(f"Skipping invalid zip {zip_path}: {exc}", file=sys.stderr)
-        return signals, documents
+        return signals, documents, failure_blocks
 
     with archive:
         for member in archive.infolist():
@@ -382,6 +541,16 @@ def process_zip(
             )
             signals.extend(member_signals)
 
+            member_blocks = extract_failure_blocks(
+                lines=lines,
+                sections=parsed_sections,
+                run_metadata=run_metadata,
+                member_name=member.filename,
+                context_lines=context_lines,
+                max_blocks=max_signals_per_log,
+            )
+            failure_blocks.extend(member_blocks)
+
             for signal in member_signals:
                 metadata = signal_metadata(signal, run_metadata)
                 metadata["doc_kind"] = "error_context"
@@ -394,7 +563,17 @@ def process_zip(
                     }
                 )
 
-    return signals, documents
+            for block in member_blocks:
+                metadata = failure_block_metadata(block, run_metadata)
+                documents.append(
+                    {
+                        "document_id": block.block_id,
+                        "text": block.text,
+                        "metadata": metadata,
+                    }
+                )
+
+    return signals, documents, failure_blocks
 
 
 def build_chunk_documents(
@@ -479,6 +658,29 @@ def signal_metadata(signal: ErrorSignal, run_metadata: dict[str, Any]) -> dict[s
     }
 
 
+def failure_block_metadata(block: FailureBlock, run_metadata: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "doc_kind": "failure_block",
+        "repository": block.repository,
+        "run_id": block.run_id,
+        "run_attempt": run_metadata.get("run_attempt"),
+        "workflow_name": block.workflow_name,
+        "job_name": block.job_name,
+        "file_name": block.file_name,
+        "start_line": block.start_line,
+        "end_line": block.end_line,
+        "failure_stage": block.failure_stage,
+        "failure_type": block.failure_type,
+        "error_type": block.failure_type,
+        "error_code": block.error_code,
+        "severity": block.severity,
+        "matched_pattern": block.matched_pattern,
+        "html_url": run_metadata.get("html_url"),
+        "commit_sha": run_metadata.get("commit_sha"),
+        "branch": run_metadata.get("branch"),
+    }
+
+
 def build_knowledge_graph(signals: list[ErrorSignal]) -> dict[str, Any]:
     nodes: dict[str, dict[str, Any]] = {}
     edges: list[dict[str, str]] = []
@@ -497,6 +699,7 @@ def build_knowledge_graph(signals: list[ErrorSignal]) -> dict[str, Any]:
         status_id = f"status:{signal.status}"
         type_id = f"error_type:{signal.error_type}"
         code_id = f"error_code:{signal.error_code}"
+        stage_id = f"failure_stage:{stable_id(signal.section)}"
 
         add_node(run_id, "workflow_run", repository=signal.repository, run_id=signal.run_id, workflow_name=signal.workflow_name)
         add_node(job_id, "job", name=signal.job_name, file_name=signal.file_name)
@@ -504,6 +707,7 @@ def build_knowledge_graph(signals: list[ErrorSignal]) -> dict[str, Any]:
         add_node(status_id, "status", name=signal.status)
         add_node(type_id, "error_type", name=signal.error_type)
         add_node(code_id, "error_code", code=signal.error_code)
+        add_node(stage_id, "failure_stage", name=signal.section)
 
         add_edge(run_id, "has_job", job_id)
         add_edge(run_id, "has_status", status_id)
@@ -511,6 +715,7 @@ def build_knowledge_graph(signals: list[ErrorSignal]) -> dict[str, Any]:
         add_edge(job_id, "has_status", status_id)
         add_edge(signal_id, "classified_as", type_id)
         add_edge(signal_id, "has_code", code_id)
+        add_edge(signal_id, "observed_in_stage", stage_id)
 
     unique_edges = [dict(item) for item in {tuple(edge.items()) for edge in edges}]
     unique_edges.sort(key=lambda item: (item["source"], item["relation"], item["target"]))
@@ -521,6 +726,12 @@ def build_knowledge_graph(signals: list[ErrorSignal]) -> dict[str, Any]:
             "node_count": len(nodes),
             "edge_count": len(unique_edges),
             "signal_count": len(signals),
+        },
+        "filter_terms": {
+            "error_codes": sorted({signal.error_code for signal in signals if signal.error_code}),
+            "error_types": sorted({signal.error_type for signal in signals if signal.error_type}),
+            "failure_stages": sorted({signal.section for signal in signals if signal.section}),
+            "failure_block_patterns": [name for name, _ in FAILURE_BLOCK_PATTERNS],
         },
         "nodes": sorted(nodes.values(), key=lambda item: item["id"]),
         "edges": unique_edges,
@@ -546,6 +757,11 @@ def training_example(signal: ErrorSignal, run_metadata_lookup: dict[tuple[str, s
         "id": signal.signal_id,
         "task": "ci_failure_root_cause_analysis",
         "label_source": "heuristic_regex",
+        "failure_stage": signal.section,
+        "failure_type": signal.error_type,
+        "error_code": signal.error_code,
+        "error_message": signal.signal_line,
+        "severity": signal.severity,
         "input": input_text,
         "output": {
             "root_cause_category": signal.error_type,
@@ -621,6 +837,210 @@ def recommended_steps(error_type: str) -> list[str]:
     return steps.get(error_type, ["Inspect the extracted error line and surrounding log context."])
 
 
+KAGGLE_COLUMN_ALIASES: dict[str, tuple[str, ...]] = {
+    "failure_stage": ("failure_stage", "stage_name", "stage", "pipeline_stage", "job_stage", "step_name"),
+    "failure_type": ("failure_type", "error_type", "root_cause", "root_cause_category", "category", "label"),
+    "error_code": ("error_code", "exit_code", "status_code", "http_status", "error_id", "code"),
+    "error_message": ("error_message", "message", "log_message", "log", "raw_log", "details", "failure_message"),
+    "severity": ("severity", "level", "log_level", "priority"),
+    "pipeline_id": ("pipeline_id", "build_id", "run_id", "workflow_run_id", "execution_id"),
+    "job_name": ("job_name", "job", "task_name", "task", "workflow_name"),
+    "status": ("status", "conclusion", "result", "outcome"),
+    "repository": ("repository", "repo", "project", "service", "application"),
+}
+
+
+def canonical_column(value: str) -> str:
+    return re.sub(r"[^a-z0-9]+", "_", value.strip().lower()).strip("_")
+
+
+def first_present(row: dict[str, Any], aliases: tuple[str, ...], default: str = "") -> str:
+    canonical_row = {canonical_column(str(key)): value for key, value in row.items()}
+    for alias in aliases:
+        value = canonical_row.get(canonical_column(alias))
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return default
+
+
+def normalize_error_label(value: str, default: str = "unknown_error") -> str:
+    value = value.strip().lower()
+    if not value:
+        return default
+    value = re.sub(r"[^a-z0-9]+", "_", value).strip("_")
+    if not value.endswith(("error", "failure", "timeout")) and value in {
+        "permission",
+        "network",
+        "dependency",
+        "configuration",
+        "resource",
+        "container",
+        "kubernetes",
+        "build",
+        "test",
+    }:
+        value = f"{value}_error" if value != "test" else "test_failure"
+    return value or default
+
+
+def normalize_error_code(value: str, message: str, error_type: str) -> str:
+    value = value.strip()
+    if not value:
+        return error_code_for_line(message, first_error_match(message), error_type)
+    if value.isdigit():
+        if any(token in message.lower() for token in ("http", "status", "response")):
+            return f"HTTP_{value}"
+        return f"EXIT_{value}"
+    return re.sub(r"[^A-Za-z0-9]+", "_", value).strip("_").upper()
+
+
+def normalize_severity(value: str, message: str, error_type: str, error_code: str) -> str:
+    value = value.strip().lower()
+    if value in {"critical", "fatal"}:
+        return "high"
+    if value in {"high", "medium", "low"}:
+        return value
+    if value in {"warn", "warning"}:
+        return "medium"
+    return classify_severity(message, error_type, error_code)
+
+
+def iter_dataset_files(dataset_path: Path) -> Iterable[Path]:
+    if dataset_path.is_file():
+        yield dataset_path
+        return
+
+    for suffix in ("*.csv", "*.jsonl", "*.ndjson", "*.json"):
+        yield from sorted(dataset_path.rglob(suffix))
+
+
+def read_dataset_file(path: Path) -> Iterable[dict[str, Any]]:
+    suffix = path.suffix.lower()
+    if suffix == ".csv":
+        with path.open("r", encoding="utf-8-sig", newline="") as fh:
+            yield from csv.DictReader(fh)
+        return
+
+    if suffix in {".jsonl", ".ndjson"}:
+        with path.open("r", encoding="utf-8") as fh:
+            for line in fh:
+                line = line.strip()
+                if line:
+                    payload = json.loads(line)
+                    if isinstance(payload, dict):
+                        yield payload
+        return
+
+    if suffix == ".json":
+        with path.open("r", encoding="utf-8") as fh:
+            payload = json.load(fh)
+        if isinstance(payload, list):
+            for item in payload:
+                if isinstance(item, dict):
+                    yield item
+        elif isinstance(payload, dict):
+            records = payload.get("records") or payload.get("data") or payload.get("rows")
+            if isinstance(records, list):
+                for item in records:
+                    if isinstance(item, dict):
+                        yield item
+            else:
+                yield payload
+
+
+def kaggle_record_to_signal(row: dict[str, Any], source_file: Path, row_number: int) -> ErrorSignal | None:
+    message = clean_line(first_present(row, KAGGLE_COLUMN_ALIASES["error_message"]))
+    if not message:
+        return None
+
+    supplied_type = first_present(row, KAGGLE_COLUMN_ALIASES["failure_type"])
+    inferred_type = classify_error(message, first_error_match(message)[0] if first_error_match(message) else "generic_error")
+    error_type = normalize_error_label(supplied_type, default=inferred_type)
+    error_code = normalize_error_code(first_present(row, KAGGLE_COLUMN_ALIASES["error_code"]), message, error_type)
+    severity = normalize_severity(first_present(row, KAGGLE_COLUMN_ALIASES["severity"]), message, error_type, error_code)
+    stage = first_present(row, KAGGLE_COLUMN_ALIASES["failure_stage"], default="unknown_stage")
+    pipeline_id = first_present(row, KAGGLE_COLUMN_ALIASES["pipeline_id"], default=f"row-{row_number}")
+    job_name = first_present(row, KAGGLE_COLUMN_ALIASES["job_name"], default=stage)
+    status = first_present(row, KAGGLE_COLUMN_ALIASES["status"], default="failure")
+    repository = first_present(
+        row,
+        KAGGLE_COLUMN_ALIASES["repository"],
+        default=f"kaggle/{DEFAULT_KAGGLE_DATASET_SLUG}",
+    )
+    fingerprint = fingerprint_error(message)
+    signal_id = stable_id("|".join([str(source_file), str(row_number), pipeline_id, fingerprint]))
+
+    return ErrorSignal(
+        signal_id=signal_id,
+        run_id=pipeline_id,
+        repository=repository,
+        workflow_name="kaggle_cicd_failure_dataset",
+        job_name=job_name or "unknown_job",
+        file_name=source_file.name,
+        line_number=row_number,
+        section=stage or "unknown_stage",
+        status=status or "failure",
+        error_type=error_type,
+        error_code=error_code,
+        pattern_name="kaggle_dataset",
+        severity=severity,
+        signal_line=message,
+        context=message,
+        fingerprint=fingerprint,
+    )
+
+
+def preprocess_kaggle_dataset(dataset_path: Path, max_records: int = 0) -> list[ErrorSignal]:
+    signals: list[ErrorSignal] = []
+    for file_path in iter_dataset_files(dataset_path):
+        for row_number, row in enumerate(read_dataset_file(file_path), start=1):
+            signal = kaggle_record_to_signal(row, file_path, row_number)
+            if signal:
+                signals.append(signal)
+            if max_records and len(signals) >= max_records:
+                return signals
+    return signals
+
+
+def download_kaggle_dataset(dataset_slug: str, data_dir: Path) -> Path:
+    target_dir = data_dir / "kaggle" / dataset_slug.split("/")[-1]
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    try:
+        import kagglehub  # type: ignore[import-not-found]
+
+        return Path(kagglehub.dataset_download(dataset_slug))
+    except ImportError:
+        command = [
+            sys.executable,
+            "-m",
+            "kaggle",
+            "datasets",
+            "download",
+            "-d",
+            dataset_slug,
+            "-p",
+            str(target_dir),
+            "--unzip",
+        ]
+        subprocess.run(command, check=True)
+        return target_dir
+
+
+def resolve_kaggle_dataset_path(args: argparse.Namespace, data_dir: Path) -> Path | None:
+    if args.kaggle_dataset_path:
+        return args.kaggle_dataset_path.resolve()
+
+    default_path = data_dir / "kaggle" / args.kaggle_dataset_slug.split("/")[-1]
+    if default_path.exists():
+        return default_path
+
+    if args.download_kaggle:
+        return download_kaggle_dataset(args.kaggle_dataset_slug, data_dir)
+
+    return None
+
+
 def resolve_zip_path(data_dir: Path, run_metadata: dict[str, Any]) -> Path | None:
     zip_path = run_metadata.get("zip_path")
     if not zip_path:
@@ -641,11 +1061,33 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--chunk-overlap", type=int, default=20, help="Overlapping lines between retrieval chunks.")
     parser.add_argument("--preprocessed-output", default="preprocessed_logs.jsonl")
     parser.add_argument("--signals-output", default="error_signals.jsonl")
+    parser.add_argument("--blocks-output", default="failure_blocks.jsonl")
     parser.add_argument("--graph-output", default="knowledge_graph.json")
     parser.add_argument("--dataset-output", default="training_dataset.jsonl")
     parser.add_argument("--vector-db", type=Path, help="SQLite vector DB path. Defaults to data-dir/vector_store.sqlite.")
     parser.add_argument("--skip-vector-db", action="store_true", help="Do not build the local vector DB.")
     parser.add_argument("--append-vectors", action="store_true", help="Append to vector DB instead of replacing gha_logs.")
+    parser.add_argument(
+        "--kaggle-dataset-path",
+        type=Path,
+        help="Local file or directory for the Kaggle CI/CD failure dataset.",
+    )
+    parser.add_argument(
+        "--kaggle-dataset-slug",
+        default=DEFAULT_KAGGLE_DATASET_SLUG,
+        help=f"Kaggle dataset slug. Defaults to {DEFAULT_KAGGLE_DATASET_SLUG}.",
+    )
+    parser.add_argument(
+        "--download-kaggle",
+        action="store_true",
+        help="Download the Kaggle dataset with kagglehub or the Kaggle CLI before preprocessing.",
+    )
+    parser.add_argument(
+        "--max-kaggle-records",
+        type=int,
+        default=0,
+        help="Maximum Kaggle records to import. Use 0 for all records.",
+    )
     return parser.parse_args()
 
 
@@ -654,13 +1096,14 @@ def main() -> int:
     data_dir = args.data_dir.resolve()
     index_path = args.index or (data_dir / "index.json")
     vector_db_path = args.vector_db or (data_dir / "vector_store.sqlite")
+    kaggle_path = resolve_kaggle_dataset_path(args, data_dir)
 
-    if not index_path.exists():
+    if not index_path.exists() and not kaggle_path:
         print(f"Missing index: {index_path}", file=sys.stderr)
-        print("Run scripts/log-collector.py first.", file=sys.stderr)
+        print("Run scripts/log-collector.py first or pass --kaggle-dataset-path / --download-kaggle.", file=sys.stderr)
         return 1
 
-    index = load_json(index_path)
+    index = load_json(index_path) if index_path.exists() else {"runs": []}
     run_records = index.get("runs", [])
     run_lookup = {
         (str(record.get("repository")), str(record.get("run_id"))): record
@@ -668,6 +1111,7 @@ def main() -> int:
     }
 
     all_signals: list[ErrorSignal] = []
+    all_blocks: list[FailureBlock] = []
     vector_documents: list[dict[str, Any]] = []
     skipped = 0
 
@@ -677,7 +1121,7 @@ def main() -> int:
             skipped += 1
             continue
 
-        signals, documents = process_zip(
+        signals, documents, failure_blocks = process_zip(
             zip_path=zip_path,
             run_metadata=run_metadata,
             context_lines=args.context_lines,
@@ -686,15 +1130,36 @@ def main() -> int:
             chunk_overlap=args.chunk_overlap,
         )
         all_signals.extend(signals)
+        all_blocks.extend(failure_blocks)
         vector_documents.extend(documents)
+
+    if kaggle_path:
+        if not kaggle_path.exists():
+            print(f"Kaggle dataset path does not exist: {kaggle_path}", file=sys.stderr)
+        else:
+            kaggle_signals = preprocess_kaggle_dataset(kaggle_path, max_records=args.max_kaggle_records)
+            all_signals.extend(kaggle_signals)
+            for signal in kaggle_signals:
+                metadata = signal_metadata(signal, {})
+                metadata["doc_kind"] = "kaggle_error_record"
+                metadata["dataset_url"] = DEFAULT_KAGGLE_DATASET_URL
+                vector_documents.append(
+                    {
+                        "document_id": f"kaggle_{signal.signal_id}",
+                        "text": signal.context,
+                        "metadata": metadata,
+                    }
+                )
 
     preprocessed_records = vector_documents
     signal_records = [asdict(signal) for signal in all_signals]
+    block_records = [asdict(block) for block in all_blocks]
     training_records = [training_example(signal, run_lookup) for signal in all_signals]
     knowledge_graph = build_knowledge_graph(all_signals)
 
     preprocessed_count = write_jsonl(data_dir / args.preprocessed_output, preprocessed_records)
     signal_count = write_jsonl(data_dir / args.signals_output, signal_records)
+    block_count = write_jsonl(data_dir / args.blocks_output, block_records)
     dataset_count = write_jsonl(data_dir / args.dataset_output, training_records)
     write_json(data_dir / args.graph_output, knowledge_graph)
 
@@ -709,7 +1174,10 @@ def main() -> int:
             vector_db.close()
 
     print(f"Processed runs: {len(run_records)}; skipped missing zips: {skipped}")
+    if kaggle_path:
+        print(f"Kaggle dataset: {kaggle_path}")
     print(f"Error signals: {signal_count}")
+    print(f"Failure blocks: {block_count}")
     print(f"Preprocessed documents: {preprocessed_count}")
     print(f"Training examples: {dataset_count}")
     print(f"Knowledge graph: {data_dir / args.graph_output}")
