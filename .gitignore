@@ -1,0 +1,12 @@
+__pycache__/
+*.pyc
+tmp*/
+tmpc_mweosm/
+data/logs/
+data/index.json
+data/preprocessed_logs.jsonl
+data/error_signals.jsonl
+data/knowledge_graph.json
+data/training_dataset.jsonl
+data/vector_store.sqlite
+data/*.tmp

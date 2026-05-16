@@ -1,0 +1,15 @@
+Prompt -1 : Code implementation for all stages in log collection and data pipeline 
+
+Generate code implementation for below stages:
+
+1. Extracting logs from GitHub Actions Workflow - Extract the logs from the failing workflows runs for "https://github.com/kubernetes/kubernetes" opensource repository under /smart-ci-remediation-agent/scripts/log-collector.py.
+
+2. Store the failure logs on local file system in the .zip files and preserve the metadata in index.json file under the /smart-ci-remediation-agent/data path
+
+3. Log pre-processing pipeline - Implement pre-processing pipeline that includes decompression and decoding the log data from the .zip files, structural parsing, noise filtering by removing the timstamps, debug verbosity statements, error signal extraction. Use the necessary regex patterns to extract the error patterns for extracting different error codes to build the knowledge graph.
+
+4. Build knowledge graph for the extracted error patterns by indexing with error codes, statuses, error types.
+
+5. Build the training dataset from the pre-processed log data. Goal is to produce labelled error-> error class pairs for training a model.
+
+6. Store the log data into the vectorDB for sematic retrieval.
