@@ -1,216 +1,681 @@
 #!/usr/bin/env python3
-"""SQLite-backed vector store for CI log retrieval.
+"""Self-Learning Knowledge Base backed by ChromaDB for CI failure RCA.
 
-This module intentionally avoids third-party dependencies. It uses a hashed
-bag-of-tokens embedding so the pipeline works offline, while keeping the same
-document/upsert/search shape you can later swap for Chroma, FAISS, pgvector, or
-remote embeddings.
+Replaces the original SQLite-backed LocalVectorDB with a production-grade
+ChromaDB vector store.  The knowledge base grows organically with every RCA
+performed — no offline training phase is required.
+
+=============================================================================
+Entity / Schema Design
+=============================================================================
+
+Collection 1 — ci_failure_logs
+────────────────────────────────
+Purpose   : Stores chunked raw CI log text for semantic similarity retrieval.
+Embedding : sentence-transformers/all-MiniLM-L6-v2  (384-dim, L2-normalised)
+
+Document attributes (ChromaDB metadata per vector):
+  document_id    TEXT  PK  Stable SHA-256 chunk / signal ID
+  doc_kind       TEXT      'log_chunk' | 'error_context' | 'failure_block'
+  repository     TEXT      e.g. 'kubernetes/kubernetes'
+  run_id         TEXT      GitHub Actions run ID
+  run_attempt    INT       Attempt number
+  workflow_name  TEXT      Workflow display name
+  job_name       TEXT      Job display name
+  file_name      TEXT      Source log filename inside the zip archive
+  start_line     INT       First log line in this chunk
+  end_line       INT       Last log line in this chunk
+  error_type     TEXT      e.g. 'dependency_error', 'permission_error'
+  error_code     TEXT      e.g. 'EXIT_1', 'HTTP_403'
+  severity       TEXT      'high' | 'medium' | 'low'
+  status         TEXT      Run conclusion (e.g. 'failure')
+  html_url       TEXT      GitHub Actions run URL
+  commit_sha     TEXT      HEAD commit SHA
+  branch         TEXT      Branch name
+  updated_at     TEXT      ISO-8601 UTC timestamp of last upsert
+
+Collection 2 — rca_knowledge_base
+───────────────────────────────────
+Purpose   : Stores (error_signature → RCA) pairs — the self-learning store.
+Embedding : Error signature text embedded via the same MiniLM model.
+
+Document attributes:
+  document_id     TEXT  PK  error_signature string used as ChromaDB ID
+  error_signature TEXT      Human-readable error signature
+  error_type      TEXT      Classified error type
+  failure_stage   TEXT      Pipeline stage where error occurred
+  source          TEXT      'knowledge_base' | 'web_search' | 'model'
+  generated_at    TEXT      ISO-8601 UTC timestamp of RCA generation
+
+Key-value sidecar (rca_repository.json):
+  Maps error_signature → full RCA payload including:
+    rca_summary, error_type, confidence, failure_stage, source, evidence,
+    generated_at, hit_count
+
+Self-Learning Loop
+───────────────────
+  CI failure
+      │
+      ▼
+  RCA Agent generates RCA
+      │
+      ▼
+  kb.update(error_signature, rca_payload)      ← auto-called after every RCA
+      │  ├── embeds signature (MiniLM 384-dim)
+      │  ├── upserts into ChromaDB collection
+      │  └── persists to JSON sidecar (atomic tmp-rename)
+      ▼
+  Next similar failure → kb.search() returns this RCA as high-similarity hit
+  (no model call needed if similarity ≥ KB_CONFIDENCE_THRESHOLD = 0.70)
+=============================================================================
 """
 
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
-import math
-import re
-import sqlite3
+import logging
+import os
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Iterable
 
+logger = logging.getLogger(__name__)
 
-DEFAULT_DB_PATH = Path(__file__).resolve().parents[1] / "data" / "vector_store.sqlite"
-TOKEN_RE = re.compile(r"[A-Za-z_][A-Za-z0-9_./:-]{1,}")
+# ---------------------------------------------------------------------------
+# Path constants
+# ---------------------------------------------------------------------------
+DEFAULT_CHROMA_PATH = Path(__file__).resolve().parents[1] / "data" / "chroma_store"
+DEFAULT_RCA_KB_PATH = Path(__file__).resolve().parents[1] / "data" / "rca_knowledge_base"
 
+LOG_COLLECTION = "ci_failure_logs"
+RCA_COLLECTION = "rca_knowledge_base"
+
+# Embedding model — matches pre-processing pipeline
+EMBEDDING_MODEL = os.getenv("EMBEDDING_MODEL", "sentence-transformers/all-MiniLM-L6-v2")
+VECTOR_DIM = 384
+
+
+# ---------------------------------------------------------------------------
+# Shared helpers
+# ---------------------------------------------------------------------------
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
 
+# Confidence labels written by heuristic / agent fallback paths
+_CONFIDENCE_LABEL_MAP: dict[str, float] = {
+    "low":    0.25,
+    "medium": 0.50,
+    "high":   0.85,
+}
+
+
+def _coerce_confidence(value: Any) -> float:
+    """
+    Coerce a confidence value to float.
+
+    Handles three cases that appear in rca_repository.json entries:
+      • Already a float / int  → cast to float directly.
+      • A numeric string       → parse with float().
+      • A label string         → map via _CONFIDENCE_LABEL_MAP
+                                  ('low' → 0.25, 'medium' → 0.50, 'high' → 0.85).
+    Returns 0.0 for any unrecognised value rather than raising.
+    """
+    if isinstance(value, (int, float)):
+        return float(value)
+    if isinstance(value, str):
+        label = value.strip().lower()
+        if label in _CONFIDENCE_LABEL_MAP:
+            return _CONFIDENCE_LABEL_MAP[label]
+        try:
+            return float(label)
+        except ValueError:
+            logger.warning("Unrecognised confidence value %r — defaulting to 0.0", value)
+            return 0.0
+    return 0.0
+
+
+def _coerce_meta(meta: dict[str, Any]) -> dict[str, Any]:
+    """
+    ChromaDB only accepts str / int / float / bool metadata values.
+    Convert everything else to str and drop None values.
+    """
+    safe: dict[str, Any] = {}
+    for key, value in meta.items():
+        if value is None:
+            continue
+        if isinstance(value, (str, int, float, bool)):
+            safe[key] = value
+        else:
+            safe[key] = str(value)
+    return safe
+
+
+# ---------------------------------------------------------------------------
+# Result dataclasses
+# ---------------------------------------------------------------------------
+
 @dataclass(frozen=True)
 class VectorSearchResult:
+    """Single result returned by a ChromaDB similarity search."""
     document_id: str
-    score: float
+    score: float          # cosine similarity in [0, 1]  (1 = identical)
     text: str
     metadata: dict[str, Any]
 
 
-class LocalVectorDB:
-    """Small local vector database backed by SQLite."""
+@dataclass(frozen=True)
+class RCAEntry:
+    """A (error_signature, RCA) pair retrieved from the self-learning KB."""
+    error_signature: str
+    rca_summary:     str
+    error_type:      str
+    confidence:      float
+    source:          str
+    failure_stage:   str
+    generated_at:    str
+    similarity:      float   # cosine similarity to query in [0, 1]
+    hit_count:       int = 0
 
-    def __init__(self, db_path: Path | str = DEFAULT_DB_PATH, dimensions: int = 512) -> None:
-        self.db_path = Path(db_path)
-        self.dimensions = dimensions
-        self.db_path.parent.mkdir(parents=True, exist_ok=True)
-        self.connection = sqlite3.connect(self.db_path)
-        self.connection.row_factory = sqlite3.Row
-        self._init_schema()
 
+# ---------------------------------------------------------------------------
+# Lazy singleton embedder (sentence-transformers/all-MiniLM-L6-v2)
+# ---------------------------------------------------------------------------
+
+class _Embedder:
+    """
+    Thin wrapper around sentence-transformers loaded on first use.
+
+    Produces L2-normalised 384-dimensional vectors for cosine similarity.
+    Raises RuntimeError with an actionable message when the library is absent.
+    """
+
+    _instance: "_Embedder | None" = None
+
+    def __init__(self) -> None:
+        try:
+            from sentence_transformers import SentenceTransformer  # type: ignore[import-not-found]
+            self._model = SentenceTransformer(EMBEDDING_MODEL)
+            logger.info("Embedding model loaded: %s", EMBEDDING_MODEL)
+        except ImportError as exc:
+            raise RuntimeError(
+                "sentence-transformers is required for ChromaDB embeddings. "
+                "Install it with:  pip install sentence-transformers"
+            ) from exc
+
+    @classmethod
+    def get(cls) -> "_Embedder":
+        if cls._instance is None:
+            cls._instance = cls()
+        return cls._instance
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        """Return a list of L2-normalised 384-dim float vectors."""
+        vecs = self._model.encode(texts, normalize_embeddings=True, show_progress_bar=False)
+        return vecs.tolist() if hasattr(vecs, "tolist") else [v.tolist() for v in vecs]
+
+    def embed_one(self, text: str) -> list[float]:
+        return self.embed([text])[0]
+
+
+# ---------------------------------------------------------------------------
+# ChromaDB vector store — Collection: ci_failure_logs
+# ---------------------------------------------------------------------------
+
+class ChromaVectorDB:
+    """
+    ChromaDB-backed vector store for CI log chunks and error signals.
+
+    Drop-in replacement for the original SQLite LocalVectorDB:
+    same public interface — upsert_document / upsert_documents / search /
+    clear_collection / close — so existing callers need no changes.
+
+    Vector space: cosine, 384 dimensions (all-MiniLM-L6-v2).
+    """
+
+    def __init__(
+        self,
+        persist_dir: Path | str = DEFAULT_CHROMA_PATH,
+        collection_name: str = LOG_COLLECTION,
+    ) -> None:
+        try:
+            import chromadb  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise RuntimeError(
+                "chromadb is required. Install it with:  pip install chromadb"
+            ) from exc
+
+        self._persist_dir = Path(persist_dir)
+        self._persist_dir.mkdir(parents=True, exist_ok=True)
+        self._client = chromadb.PersistentClient(path=str(self._persist_dir))
+        self._collection_name = collection_name
+        self._collection = self._client.get_or_create_collection(
+            name=collection_name,
+            metadata={"hnsw:space": "cosine"},
+        )
+        logger.info(
+            "ChromaVectorDB ready — collection=%s  path=%s  count=%d",
+            collection_name, self._persist_dir, self._collection.count(),
+        )
+
+    # ------------------------------------------------------------------
     def close(self) -> None:
-        self.connection.close()
+        """No-op: ChromaDB persists automatically. Kept for API compatibility."""
 
-    def clear_collection(self, collection: str) -> None:
-        with self.connection:
-            self.connection.execute("DELETE FROM documents WHERE collection = ?", (collection,))
+    def clear_collection(self, collection: str | None = None) -> None:
+        name = collection or self._collection_name
+        try:
+            self._client.delete_collection(name)
+        except Exception:  # noqa: BLE001
+            pass
+        self._collection = self._client.get_or_create_collection(
+            name=name, metadata={"hnsw:space": "cosine"}
+        )
 
+    # ------------------------------------------------------------------
     def upsert_document(
         self,
         document_id: str,
         text: str,
         metadata: dict[str, Any],
-        collection: str = "gha_logs",
+        collection: str = LOG_COLLECTION,
     ) -> None:
-        embedding = self.embed(text)
-        with self.connection:
-            self.connection.execute(
-                """
-                INSERT INTO documents (
-                    id, collection, text, metadata_json, embedding_json, updated_at
-                )
-                VALUES (?, ?, ?, ?, ?, ?)
-                ON CONFLICT(id) DO UPDATE SET
-                    collection = excluded.collection,
-                    text = excluded.text,
-                    metadata_json = excluded.metadata_json,
-                    embedding_json = excluded.embedding_json,
-                    updated_at = excluded.updated_at
-                """,
-                (
-                    document_id,
-                    collection,
-                    text,
-                    json.dumps(metadata, sort_keys=True),
-                    json.dumps(embedding, sort_keys=True),
-                    utc_now(),
-                ),
-            )
+        embedding = _Embedder.get().embed_one(text)
+        col = self._get_collection(collection)
+        col.upsert(
+            ids=[document_id],
+            documents=[text],
+            embeddings=[embedding],
+            metadatas=[_coerce_meta({**metadata, "updated_at": utc_now()})],
+        )
 
     def upsert_documents(
         self,
         documents: Iterable[dict[str, Any]],
-        collection: str = "gha_logs",
+        collection: str = LOG_COLLECTION,
+        batch_size: int = 64,
     ) -> int:
+        col = self._get_collection(collection)
+        embedder = _Embedder.get()
+
+        ids:   list[str]           = []
+        texts: list[str]           = []
+        metas: list[dict[str, Any]] = []
         count = 0
-        for document in documents:
-            self.upsert_document(
-                document_id=document["document_id"],
-                text=document["text"],
-                metadata=document.get("metadata", {}),
-                collection=collection,
-            )
+
+        def _flush() -> None:
+            if not ids:
+                return
+            vecs = embedder.embed(texts)
+            col.upsert(ids=ids, documents=texts, embeddings=vecs, metadatas=metas)
+            ids.clear(); texts.clear(); metas.clear()
+
+        for doc in documents:
+            ids.append(doc["document_id"])
+            texts.append(doc["text"])
+            metas.append(_coerce_meta({**doc.get("metadata", {}), "updated_at": utc_now()}))
             count += 1
+            if len(ids) >= batch_size:
+                _flush()
+        _flush()
         return count
 
+    # ------------------------------------------------------------------
     def search(
         self,
         query: str,
         top_k: int = 5,
-        collection: str = "gha_logs",
+        collection: str = LOG_COLLECTION,
+        where: dict[str, Any] | None = None,
     ) -> list[VectorSearchResult]:
-        query_embedding = self.embed(query)
-        if not query_embedding:
+        col = self._get_collection(collection)
+        if col.count() == 0:
             return []
 
-        rows = self.connection.execute(
-            "SELECT id, text, metadata_json, embedding_json FROM documents WHERE collection = ?",
-            (collection,),
-        ).fetchall()
+        query_vec = _Embedder.get().embed_one(query)
+        kwargs: dict[str, Any] = {
+            "query_embeddings": [query_vec],
+            "n_results":        min(top_k, col.count()),
+            "include":          ["documents", "metadatas", "distances"],
+        }
+        if where:
+            kwargs["where"] = where
 
-        results: list[VectorSearchResult] = []
-        for row in rows:
-            embedding = json.loads(row["embedding_json"])
-            score = cosine_similarity(query_embedding, embedding)
-            if score <= 0:
+        result = col.query(**kwargs)
+
+        output: list[VectorSearchResult] = []
+        for doc_id, text, meta, dist in zip(
+            result["ids"][0],
+            result["documents"][0],
+            result["metadatas"][0],
+            result["distances"][0],
+        ):
+            # ChromaDB cosine space: distance ∈ [0, 2]  →  similarity = 1 - dist/2
+            similarity = max(0.0, 1.0 - dist / 2.0)
+            output.append(VectorSearchResult(
+                document_id=doc_id,
+                score=round(similarity, 4),
+                text=text,
+                metadata=meta,
+            ))
+
+        output.sort(key=lambda r: r.score, reverse=True)
+        return output
+
+    # ------------------------------------------------------------------
+    def _get_collection(self, name: str):  # type: ignore[return]
+        if name == self._collection_name:
+            return self._collection
+        return self._client.get_or_create_collection(
+            name=name, metadata={"hnsw:space": "cosine"}
+        )
+
+
+# ---------------------------------------------------------------------------
+# Self-Learning Knowledge Base — Collection: rca_knowledge_base
+# ---------------------------------------------------------------------------
+
+class SelfLearningKnowledgeBase:
+    """
+    Self-learning vector knowledge base for (error_signature → RCA) pairs.
+
+    Architecture
+    ─────────────
+    Vector store  : ChromaDB collection 'rca_knowledge_base'
+                    Stores error-signature embeddings for fast similarity search.
+    Key-value sidecar : rca_repository.json
+                    Maps each error_signature → full RCA payload dict.
+
+    Self-Learning Loop
+    ───────────────────
+    1. RCA Agent generates a new RCA for an incoming CI failure.
+    2. Agent calls  kb.update(error_signature, rca_payload)
+    3. KB embeds the signature → upserts into ChromaDB.
+    4. KB persists the full RCA to the JSON sidecar (atomic write).
+    5. Next time a similar failure arrives:
+         kb.search(error_signature) returns the historical RCA with a
+         similarity score.  If score ≥ KB_CONFIDENCE_THRESHOLD (0.70) the
+         RCA Agent uses it directly — no model call needed.
+
+    Key Features
+    ─────────────
+    • No Offline Phase : KB starts empty, grows with every RCA generation.
+    • Automatic Updates: Every RCA generation triggers kb.update().
+    • Vector Similarity: Fast cosine-similarity retrieval over embeddings.
+    • Key-Value Store  : Efficient (error_signature → full RCA) mapping.
+    • Hit Tracking     : hit_count incremented on every retrieval.
+    """
+
+    def __init__(
+        self,
+        persist_dir: Path | str = DEFAULT_RCA_KB_PATH,
+        confidence_threshold: float = 0.70,
+    ) -> None:
+        persist_dir = Path(persist_dir)
+        persist_dir.mkdir(parents=True, exist_ok=True)
+
+        try:
+            import chromadb  # type: ignore[import-not-found]
+        except ImportError as exc:
+            raise RuntimeError(
+                "chromadb is required. Install it with:  pip install chromadb"
+            ) from exc
+
+        self._client = chromadb.PersistentClient(path=str(persist_dir))
+        self._collection = self._client.get_or_create_collection(
+            name=RCA_COLLECTION,
+            metadata={"hnsw:space": "cosine"},
+        )
+        self._kv_path = persist_dir / "rca_repository.json"
+        self._rca_repository: dict[str, dict[str, Any]] = self._load_kv()
+        self.confidence_threshold = confidence_threshold
+
+        logger.info(
+            "SelfLearningKnowledgeBase ready — %d entries  threshold=%.2f",
+            len(self._rca_repository), confidence_threshold,
+        )
+
+    # ------------------------------------------------------------------
+    # Public API
+    # ------------------------------------------------------------------
+
+    def search(
+        self,
+        error_signature: str,
+        top_k: int = 5,
+    ) -> list[RCAEntry]:
+        """
+        Return the top-k most similar historical (error, RCA) pairs.
+
+        Parameters
+        ----------
+        error_signature : str
+            Human-readable or hashed error signature produced by the
+            preprocessing pipeline (e.g. 'ImportError_module_not_found_sklearn').
+        top_k : int
+            Maximum number of results to return.
+
+        Returns
+        -------
+        list[RCAEntry]
+            Ordered by descending cosine similarity.  Empty list when the KB
+            has no entries yet.
+        """
+        if self._collection.count() == 0:
+            return []
+
+        query_vec = _Embedder.get().embed_one(error_signature)
+        n = min(top_k, self._collection.count())
+        result = self._collection.query(
+            query_embeddings=[query_vec],
+            n_results=n,
+            include=["metadatas", "distances"],
+        )
+
+        entries: list[RCAEntry] = []
+        for meta, dist in zip(result["metadatas"][0], result["distances"][0]):
+            sig  = str(meta.get("error_signature", ""))
+            sim  = max(0.0, 1.0 - dist / 2.0)
+            rca  = self._rca_repository.get(sig)
+            if not rca:
                 continue
-            results.append(
-                VectorSearchResult(
-                    document_id=row["id"],
-                    score=score,
-                    text=row["text"],
-                    metadata=json.loads(row["metadata_json"]),
-                )
-            )
+            entries.append(RCAEntry(
+                error_signature=sig,
+                rca_summary    =str(rca.get("rca_summary", "")),
+                error_type     =str(rca.get("error_type", "")),
+                confidence     =_coerce_confidence(rca.get("confidence", 0.0)),
+                source         =str(rca.get("source", "knowledge_base")),
+                failure_stage  =str(rca.get("failure_stage", "")),
+                generated_at   =str(rca.get("generated_at", "")),
+                similarity     =round(sim, 4),
+                hit_count      =int(rca.get("hit_count", 0)),
+            ))
 
-        results.sort(key=lambda item: item.score, reverse=True)
-        return results[:top_k]
+        entries.sort(key=lambda e: e.similarity, reverse=True)
 
-    def embed(self, text: str) -> dict[str, float]:
-        vector: dict[int, float] = {}
-        for token in TOKEN_RE.findall(text.lower()):
-            index = stable_hash(token) % self.dimensions
-            vector[index] = vector.get(index, 0.0) + 1.0
+        # Increment hit counts for returned entries
+        for entry in entries:
+            stored = self._rca_repository.get(entry.error_signature)
+            if stored:
+                stored["hit_count"] = stored.get("hit_count", 0) + 1
+        if entries:
+            self._save_kv()
 
-        norm = math.sqrt(sum(value * value for value in vector.values()))
-        if norm == 0:
-            return {}
-        return {str(index): value / norm for index, value in sorted(vector.items())}
+        return entries
 
-    def _init_schema(self) -> None:
-        with self.connection:
-            self.connection.execute(
-                """
-                CREATE TABLE IF NOT EXISTS documents (
-                    id TEXT PRIMARY KEY,
-                    collection TEXT NOT NULL,
-                    text TEXT NOT NULL,
-                    metadata_json TEXT NOT NULL,
-                    embedding_json TEXT NOT NULL,
-                    updated_at TEXT NOT NULL
-                )
-                """
-            )
-            self.connection.execute(
-                "CREATE INDEX IF NOT EXISTS idx_documents_collection ON documents(collection)"
-            )
+    def update(
+        self,
+        error_signature: str,
+        rca_payload: dict[str, Any],
+    ) -> None:
+        """
+        Persist a new (error_signature → RCA) pair to the knowledge base.
+
+        Called automatically by the RCA Agent after every successful RCA
+        generation so the KB grows with usage.
+
+        Parameters
+        ----------
+        error_signature : str
+            Human-readable error signature from the preprocessing pipeline.
+        rca_payload : dict
+            RCA result dict.  Must contain at minimum:
+            rca_summary, error_type, confidence, failure_stage, source.
+            May also contain evidence and inline_fix_suggestions.
+        """
+        embedding = _Embedder.get().embed_one(error_signature)
+        self._collection.upsert(
+            ids=[error_signature],
+            embeddings=[embedding],
+            documents=[error_signature],
+            metadatas=[_coerce_meta({
+                "error_signature": error_signature,
+                "error_type":      rca_payload.get("error_type", ""),
+                "failure_stage":   rca_payload.get("failure_stage", ""),
+                "source":          rca_payload.get("source", "knowledge_base"),
+                "generated_at":    utc_now(),
+            })],
+        )
+        # Preserve existing hit_count when overwriting an entry
+        existing = self._rca_repository.get(error_signature, {})
+        self._rca_repository[error_signature] = {
+            "rca_summary":           rca_payload.get("rca_summary", ""),
+            "error_type":            rca_payload.get("error_type", ""),
+            "confidence":            rca_payload.get("confidence", 0.0),
+            "failure_stage":         rca_payload.get("failure_stage", ""),
+            "source":                rca_payload.get("source", "knowledge_base"),
+            "evidence":              rca_payload.get("evidence", []),
+            "inline_fix_suggestions":rca_payload.get("inline_fix_suggestions", []),
+            "generated_at":          utc_now(),
+            "hit_count":             existing.get("hit_count", 0),
+        }
+        self._save_kv()
+        logger.debug("KB updated — signature=%s", error_signature)
+
+    def best_confidence(self, entries: list[RCAEntry]) -> float:
+        """Return the highest similarity score from a search result list."""
+        return max((e.similarity for e in entries), default=0.0)
+
+    # ------------------------------------------------------------------
+    # Persistence helpers
+    # ------------------------------------------------------------------
+
+    def _load_kv(self) -> dict[str, dict[str, Any]]:
+        if self._kv_path.exists():
+            try:
+                with self._kv_path.open("r", encoding="utf-8") as fh:
+                    return json.load(fh)
+            except (json.JSONDecodeError, OSError) as exc:
+                logger.warning("Could not load RCA repository from %s: %s", self._kv_path, exc)
+        return {}
+
+    def _save_kv(self) -> None:
+        """Atomic write via tmp file → rename."""
+        tmp = self._kv_path.with_suffix(".json.tmp")
+        with tmp.open("w", encoding="utf-8") as fh:
+            json.dump(self._rca_repository, fh, indent=2, sort_keys=True)
+        tmp.replace(self._kv_path)
 
 
-def stable_hash(value: str) -> int:
-    return int.from_bytes(hashlib.blake2b(value.encode("utf-8"), digest_size=8).digest(), "big")
+# ---------------------------------------------------------------------------
+# Backwards-compatible alias
+# ---------------------------------------------------------------------------
+
+class LocalVectorDB(ChromaVectorDB):
+    """
+    Backwards-compatible shim so existing callers can continue to use:
+        from db import LocalVectorDB
+
+    Accepts the legacy ``db_path`` keyword argument and routes to
+    ChromaVectorDB using the parent directory's chroma_store/.
+
+    Any new code should use ChromaVectorDB directly.
+    """
+
+    def __init__(
+        self,
+        db_path: Path | str | None = None,
+        dimensions: int = VECTOR_DIM,
+        **kwargs: Any,
+    ) -> None:
+        if db_path is None:
+            persist_dir = DEFAULT_CHROMA_PATH
+        else:
+            # Legacy callers may pass e.g. data/vector_store.sqlite — route to
+            # the sibling chroma_store/ directory instead.
+            persist_dir = Path(db_path).parent / "chroma_store"
+        super().__init__(persist_dir=persist_dir, **kwargs)
 
 
-def cosine_similarity(left: dict[str, float], right: dict[str, float]) -> float:
-    if len(left) > len(right):
-        left, right = right, left
-    return sum(value * right.get(index, 0.0) for index, value in left.items())
-
+# ---------------------------------------------------------------------------
+# CLI — query either collection from the command line
+# ---------------------------------------------------------------------------
 
 def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(description="Query the local CI log vector store.")
+    parser = argparse.ArgumentParser(
+        description="Query the ChromaDB CI log vector store or RCA knowledge base."
+    )
     parser.add_argument("query", nargs="?", help="Search query.")
-    parser.add_argument("--db", type=Path, default=DEFAULT_DB_PATH, help="SQLite vector store path.")
-    parser.add_argument("--collection", default="gha_logs", help="Collection name.")
+    parser.add_argument(
+        "--db", type=Path, default=DEFAULT_CHROMA_PATH,
+        help="ChromaDB persist directory (default: data/chroma_store).",
+    )
+    parser.add_argument(
+        "--collection", default=LOG_COLLECTION,
+        help=f"Collection name (default: {LOG_COLLECTION}).",
+    )
     parser.add_argument("--top-k", type=int, default=5, help="Number of results to return.")
+    parser.add_argument(
+        "--kb", action="store_true",
+        help="Query the RCA knowledge base (data/rca_knowledge_base) instead.",
+    )
     return parser.parse_args()
 
 
 def main() -> int:
     args = parse_args()
+
+    # ---- RCA knowledge-base mode ----
+    if args.kb:
+        kb = SelfLearningKnowledgeBase(persist_dir=DEFAULT_RCA_KB_PATH)
+        if not args.query:
+            print(f"RCA Knowledge Base : {DEFAULT_RCA_KB_PATH}")
+            print(f"Entries            : {len(kb._rca_repository)}")
+            print("Pass a query to search the knowledge base.")
+            return 0
+        results = kb.search(args.query, top_k=args.top_k)
+        for entry in results:
+            print(f"{entry.similarity:.3f}  [{entry.error_type}]  {entry.error_signature}")
+            print(f"         {entry.rca_summary[:200]}")
+            print()
+        return 0
+
+    # ---- Log vector store mode ----
+    db = ChromaVectorDB(persist_dir=args.db, collection_name=args.collection)
     if not args.query:
-        print(f"Vector store path: {args.db}")
+        print(f"ChromaDB path : {args.db}")
+        print(f"Collection    : {args.collection}")
+        print(f"Documents     : {db._collection.count()}")
         print("Pass a query to search indexed log excerpts.")
         return 0
 
-    db = LocalVectorDB(args.db)
-    try:
-        results = db.search(args.query, top_k=args.top_k, collection=args.collection)
-    finally:
-        db.close()
-
+    results = db.search(args.query, top_k=args.top_k, collection=args.collection)
     for result in results:
-        metadata = result.metadata
+        meta  = result.metadata
         title = " / ".join(
-            str(value)
-            for value in (
-                metadata.get("workflow_name"),
-                metadata.get("job_name"),
-                metadata.get("error_type"),
-                metadata.get("error_code"),
+            str(v)
+            for v in (
+                meta.get("workflow_name"),
+                meta.get("job_name"),
+                meta.get("error_type"),
+                meta.get("error_code"),
             )
-            if value
+            if v
         )
-        print(f"{result.score:.3f} {result.document_id} {title}")
+        print(f"{result.score:.3f}  {result.document_id}  {title}")
         print(result.text[:500].replace("\n", " "))
         print()
     return 0

@@ -1,12 +1,20 @@
 #!/usr/bin/env python3
 """Pre-process collected GitHub Actions logs for CI failure RCA.
 
+Revised pipeline (per REVISED_ARCHITECTURE_PLAN.md):
+  Step 1  Log Normalization      — clean ANSI, timestamps, control chars
+  Step 2  Error Block Extraction — pattern-matched blocks with ±10-line context
+  Step 3  Context Enrichment     — CI/repo metadata, severity, impact
+  Step 4  Error Signature        — SHA-256 hash + human-readable label
+  Step 5  Vector Embedding       — sentence-transformers/all-MiniLM-L6-v2 (384-dim)
+
 Pipeline outputs:
-- preprocessed_logs.jsonl: cleaned failure excerpts
-- error_signals.jsonl: extracted error signals and weak labels
-- knowledge_graph.json: run/job/error/status/type/code graph
-- training_dataset.jsonl: labelled input -> output examples
-- vector_store.sqlite: local vector store for semantic retrieval
+- preprocessed_logs.jsonl   : cleaned failure excerpts
+- error_signals.jsonl       : extracted error signals and weak labels
+- failure_blocks.jsonl      : failure block records
+- knowledge_graph.json      : run/job/error/status/type/code graph
+- training_dataset.jsonl    : labelled input -> output examples
+- chroma_store/             : ChromaDB vector store for semantic retrieval
 """
 
 from __future__ import annotations
@@ -15,6 +23,7 @@ import argparse
 import csv
 import hashlib
 import json
+import logging
 import os
 import re
 import shutil
@@ -28,8 +37,10 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from db import LocalVectorDB
+from db import LocalVectorDB, ChromaVectorDB, _Embedder as _SentenceEmbedder
 from env_loader import load_dotenv
+
+logger = logging.getLogger(__name__)
 
 
 load_dotenv()
@@ -1299,6 +1310,551 @@ def resolve_zip_path(data_dir: Path, run_metadata: dict[str, Any]) -> Path | Non
     return path
 
 
+# ===========================================================================
+# Revised Architecture – Data Processing Pipeline Components
+# (REVISED_ARCHITECTURE_PLAN.md §2)
+# ===========================================================================
+
+@dataclass
+class ErrorBlock:
+    """
+    Step 2 output: a single extracted error block with full context.
+
+    Mirrors the EnrichedErrorBlock schema from the revised architecture plan.
+    """
+    error_type: str                   # e.g. 'ImportError', 'TestFailure'
+    error_message: str                # Primary error message text
+    error_code: str                   # Error code if present, else ''
+    stack_trace: list[str]            # Stack trace lines (may be empty)
+    context_before: list[str]         # Up to 10 lines before the error
+    context_after: list[str]          # Up to 10 lines after the error
+    file_path: str                    # File where error occurred ('' if unknown)
+    line_number: int | None           # Log line number (None if unknown)
+    timestamp: str                    # ISO-8601 UTC timestamp of extraction
+    # Enrichment fields (Step 3)
+    repository: str = ""
+    language: str = ""
+    framework: str = ""
+    ci_environment: dict[str, Any] = field(default_factory=dict)
+    dependencies: list[dict[str, str]] = field(default_factory=list)
+    severity: str = "low"             # 'critical' | 'high' | 'medium' | 'low'
+    impact_scope: str = "unknown"     # 'build' | 'test' | 'deployment'
+
+
+@dataclass
+class ErrorSignatureResult:
+    """
+    Step 4 output: deterministic error signature for deduplication.
+    """
+    hash: str             # SHA-256 hash of normalised error components
+    readable: str         # e.g. 'ImportError_module_not_found_sklearn'
+    components: dict[str, str] = field(default_factory=dict)
+
+
+@dataclass
+class EmbeddingResult:
+    """
+    Step 5 output: 384-dimensional L2-normalised embeddings.
+    """
+    error_embedding: list[float]      # Shape: (384,)
+    context_embedding: list[float]    # Shape: (384,)
+    combined_embedding: list[float]   # Shape: (384,)
+
+
+@dataclass
+class ProcessedLog:
+    """
+    Complete output of the PreprocessingPipeline for a single CI log.
+
+    Passed directly to the RCA Agent as structured context input.
+    """
+    normalized_log: str
+    error_blocks: list[ErrorBlock]
+    primary_error: ErrorBlock | None
+    error_signature: ErrorSignatureResult | None
+    embeddings: EmbeddingResult | None
+    metadata: dict[str, Any] = field(default_factory=dict)
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Text Embedder
+# ---------------------------------------------------------------------------
+
+class TextEmbedder:
+    """
+    Transformer-based text embedding using sentence-transformers/all-MiniLM-L6-v2.
+
+    Produces L2-normalised 384-dimensional vectors for cosine similarity search.
+    Falls back to a deterministic zero vector when the library is unavailable.
+    """
+
+    ZERO_VEC: list[float] = [0.0] * 384
+
+    def __init__(self, model: str = "sentence-transformers/all-MiniLM-L6-v2") -> None:
+        self.model_name = model
+        self._ready = False
+        try:
+            self._embedder = _SentenceEmbedder.get()
+            self._ready = True
+        except RuntimeError:
+            logger.warning(
+                "sentence-transformers unavailable — zero-vector fallback enabled. "
+                "Run: pip install sentence-transformers"
+            )
+
+    def embed(self, text: str) -> list[float]:
+        if not self._ready:
+            return self.ZERO_VEC[:]
+        return self._embedder.embed_one(text)
+
+    def embed_batch(self, texts: list[str]) -> list[list[float]]:
+        if not self._ready:
+            return [self.ZERO_VEC[:] for _ in texts]
+        return self._embedder.embed(texts)
+
+
+# ---------------------------------------------------------------------------
+# Step 1: Log Parser / Normaliser
+# ---------------------------------------------------------------------------
+
+class LogParser:
+    """
+    Step 1 — Log Normalization.
+
+    Actions:
+    • Strip ANSI colour codes and control characters
+    • Normalise timestamps to ISO 8601 (remove leading timestamp prefixes)
+    • Standardise file paths (relative to project root when detectable)
+    • Deduplicate consecutive identical lines
+    • Normalise whitespace and line endings
+    """
+
+    # Re-use the module-level compiled patterns
+    def normalize(self, raw_log: str) -> str:
+        lines = raw_log.splitlines()
+        cleaned: list[str] = []
+        prev: str | None = None
+        for raw_line in lines:
+            line = clean_line(raw_line)
+            if is_noise(line):
+                continue
+            if line == prev:          # deduplicate consecutive identical lines
+                continue
+            cleaned.append(line)
+            prev = line
+        return "\n".join(cleaned)
+
+
+# ---------------------------------------------------------------------------
+# Step 2: Error Block Extractor
+# ---------------------------------------------------------------------------
+
+_STACK_TRACE_RE = re.compile(
+    r"(?:Traceback|at |^\s+File |^\s+in |Error:|Exception:)", re.M
+)
+_FILE_PATH_RE = re.compile(r'(?:File "?([^",\n]+)"?|in ([^\s\n]+))', re.I)
+_LINE_NUM_RE = re.compile(r"line (\d+)", re.I)
+
+
+class ErrorBlockExtractor:
+    """
+    Step 2 — Error Block Extraction.
+
+    For each error pattern match:
+    • Capture ±10 lines of surrounding context
+    • Detect and attach complete stack traces
+    • Extract file paths and line numbers
+    • Build a structured ErrorBlock
+    """
+
+    CONTEXT_WINDOW = 10
+
+    def extract(self, normalized_log: str) -> list[ErrorBlock]:
+        lines_raw = normalized_log.splitlines()
+        lines: list[tuple[int, str]] = [
+            (i + 1, line) for i, line in enumerate(lines_raw)
+        ]
+        blocks: list[ErrorBlock] = []
+        seen_fingerprints: set[str] = set()
+        now_ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+        for idx, (line_number, line) in enumerate(lines):
+            match_payload = first_error_match(line)
+            if not match_payload:
+                continue
+
+            pattern_name, match = match_payload
+            fp = fingerprint_error(line)
+            if fp in seen_fingerprints:
+                continue
+            seen_fingerprints.add(fp)
+
+            error_type = classify_error(line, pattern_name)
+            error_code = extract_error_code(line, match, error_type)
+
+            # Context windows
+            before_start = max(0, idx - self.CONTEXT_WINDOW)
+            after_end = min(len(lines), idx + self.CONTEXT_WINDOW + 1)
+            context_before = [l for _, l in lines[before_start:idx]]
+            context_after = [l for _, l in lines[idx + 1: after_end]]
+
+            # Stack trace: collect contiguous lines that look like trace frames
+            stack_trace: list[str] = []
+            for _, tl in lines[idx: min(len(lines), idx + 30)]:
+                if _STACK_TRACE_RE.search(tl):
+                    stack_trace.append(tl)
+
+            # File path and line number extraction
+            file_path = ""
+            ln: int | None = None
+            fp_match = _FILE_PATH_RE.search(line)
+            if fp_match:
+                file_path = (fp_match.group(1) or fp_match.group(2) or "").strip()
+            ln_match = _LINE_NUM_RE.search(line)
+            if ln_match:
+                ln = int(ln_match.group(1))
+
+            blocks.append(
+                ErrorBlock(
+                    error_type=error_type,
+                    error_message=line,
+                    error_code=error_code,
+                    stack_trace=stack_trace,
+                    context_before=context_before,
+                    context_after=context_after,
+                    file_path=file_path,
+                    line_number=ln or line_number,
+                    timestamp=now_ts,
+                )
+            )
+
+        return blocks
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Context Enricher
+# ---------------------------------------------------------------------------
+
+class ContextEnricher:
+    """
+    Step 3 — Context Enrichment.
+
+    Integrates CI/repository metadata into each ErrorBlock and computes
+    error severity and impact scope.
+    """
+
+    _IMPACT_MAP: dict[str, str] = {
+        "build_error": "build",
+        "dependency_error": "build",
+        "test_failure": "test",
+        "configuration_error": "deployment",
+        "kubernetes_error": "deployment",
+        "container_error": "deployment",
+        "permission_error": "deployment",
+        "timeout": "deployment",
+        "network_error": "deployment",
+        "resource_error": "deployment",
+    }
+
+    def enrich(
+        self,
+        error_blocks: list[ErrorBlock],
+        normalized_log: str,
+        metadata: dict[str, Any],
+    ) -> list[ErrorBlock]:
+        enriched: list[ErrorBlock] = []
+        env = metadata.get("environment", {})
+        for block in error_blocks:
+            severity = classify_severity(block.error_message, block.error_type, block.error_code)
+            if severity == "low" and block.error_type in {
+                "permission_error", "network_error", "timeout", "resource_error"
+            }:
+                severity = "medium"
+            block = ErrorBlock(
+                error_type=block.error_type,
+                error_message=block.error_message,
+                error_code=block.error_code,
+                stack_trace=block.stack_trace,
+                context_before=block.context_before,
+                context_after=block.context_after,
+                file_path=block.file_path,
+                line_number=block.line_number,
+                timestamp=block.timestamp,
+                repository=metadata.get("repository", ""),
+                language=env.get("language", ""),
+                framework=env.get("framework", ""),
+                ci_environment={
+                    "os": env.get("os", ""),
+                    "runner": env.get("runner", ""),
+                    "workflow": metadata.get("workflow_name", ""),
+                    "job": metadata.get("job_name", ""),
+                },
+                dependencies=metadata.get("dependencies", []),
+                severity=severity,
+                impact_scope=self._IMPACT_MAP.get(block.error_type, "unknown"),
+            )
+            enriched.append(block)
+        return enriched
+
+
+# ---------------------------------------------------------------------------
+# Step 4: Error Signature Generator
+# ---------------------------------------------------------------------------
+
+class ErrorSignatureGenerator:
+    """
+    Step 4 — Error Signature Generation.
+
+    Produces a deterministic SHA-256 hash and human-readable label for each
+    primary error block. Used as the key in the self-learning KB.
+    """
+
+    _VARIABLE_RE = re.compile(
+        r"(?:0x[0-9a-f]+|[0-9a-f]{8,}|\b\d+\b|/[^\s:]+|\"[^\"]+\")",
+        re.I,
+    )
+
+    def generate(self, block: ErrorBlock) -> ErrorSignatureResult:
+        normalised_msg = self._normalise(block.error_message)
+        normalised_loc = self._normalise(block.file_path or "")
+        raw = f"{block.error_type}|{normalised_msg}|{normalised_loc}"
+        sig_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+        # Build human-readable label: type_keyword1_keyword2
+        key_tokens = [
+            t for t in re.split(r"[^a-z0-9]+", normalised_msg.lower())
+            if len(t) > 3 and not t.isdigit()
+        ][:4]
+        readable = "_".join([block.error_type] + key_tokens) or sig_hash[:16]
+
+        return ErrorSignatureResult(
+            hash=sig_hash,
+            readable=readable,
+            components={
+                "error_type": block.error_type,
+                "error_location": block.file_path or "",
+                "error_pattern": normalised_msg[:120],
+            },
+        )
+
+    def _normalise(self, text: str) -> str:
+        text = self._VARIABLE_RE.sub("<var>", text)
+        return re.sub(r"\s+", " ", text).strip().lower()
+
+
+# ---------------------------------------------------------------------------
+# Main PreprocessingPipeline orchestrator
+# ---------------------------------------------------------------------------
+
+class PreprocessingPipeline:
+    """
+    Real-time preprocessing pipeline for CI failure logs.
+
+    Orchestrates all five steps defined in REVISED_ARCHITECTURE_PLAN.md §2:
+
+    Step 1: Log Normalization    → clean, deduplicated log text
+    Step 2: Error Block Extract  → list[ErrorBlock] with context windows
+    Step 3: Context Enrichment   → attach CI/repo metadata + severity
+    Step 4: Error Signature      → deterministic SHA-256 + readable label
+    Step 5: Vector Embedding     → 384-dim L2-normalised embeddings
+
+    Returns a ProcessedLog ready to be consumed by the RCA Agent.
+
+    RCA Agent input contract (vectorized context for model)
+    ────────────────────────────────────────────────────────
+    {
+        "vectorized_error":   EmbeddingResult.error_embedding   (384-dim float list)
+        "vectorized_context": EmbeddingResult.context_embedding (384-dim float list)
+        "error_signature":    ErrorSignatureResult.readable     (string key for KB)
+        "error_blocks":       [EnrichedErrorBlock, ...]         (structured dicts)
+        "metadata":           dict                              (CI/run context)
+    }
+    """
+
+    def __init__(
+        self,
+        embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
+        context_window: int = 10,
+    ) -> None:
+        self.log_parser = LogParser()
+        self.error_extractor = ErrorBlockExtractor()
+        self.context_enricher = ContextEnricher()
+        self.signature_generator = ErrorSignatureGenerator()
+        self.embedder = TextEmbedder(model=embedding_model)
+        self._context_window = context_window
+
+    # ------------------------------------------------------------------
+    def process(self, raw_log: str, metadata: dict[str, Any]) -> ProcessedLog:
+        """
+        Transform a raw CI failure log into a fully structured ProcessedLog.
+
+        Parameters
+        ----------
+        raw_log : str
+            Raw text from a GitHub Actions log file (may contain ANSI codes,
+            timestamps, control characters, etc.)
+        metadata : dict
+            Run/job metadata dict — should contain at minimum:
+            repository, run_id, workflow_name, job_name, branch, commit_sha.
+            Optionally an 'environment' sub-dict with os/runner/language/framework.
+
+        Returns
+        -------
+        ProcessedLog
+            Fully enriched log object ready for KB search and RCA generation.
+        """
+        # Step 1 – Log Normalization
+        normalized = self.log_parser.normalize(raw_log)
+
+        # Step 2 – Error Block Extraction
+        raw_blocks = self.error_extractor.extract(normalized)
+
+        # Step 3 – Context Enrichment
+        enriched_blocks = self.context_enricher.enrich(raw_blocks, normalized, metadata)
+
+        # Step 4 – Error Signature Generation
+        primary_error = self._identify_primary(enriched_blocks)
+        error_signature = self.signature_generator.generate(primary_error) if primary_error else None
+
+        # Step 5 – Vector Embedding
+        embeddings = self._generate_embeddings(primary_error, normalized) if primary_error else None
+
+        return ProcessedLog(
+            normalized_log=normalized,
+            error_blocks=enriched_blocks,
+            primary_error=primary_error,
+            error_signature=error_signature,
+            embeddings=embeddings,
+            metadata=metadata,
+        )
+
+    # ------------------------------------------------------------------
+    def process_to_rca_input(
+        self,
+        raw_log: str,
+        metadata: dict[str, Any],
+    ) -> dict[str, Any]:
+        """
+        Convenience method: process a log and return the structured RCA input dict.
+
+        The returned dict contains all fields expected by the RCA Agent:
+        • vectorized_error        — embedding of the primary error message
+        • vectorized_context      — embedding of the full normalized log excerpt
+        • vectorized_combined     — combined error+context embedding
+        • error_signature         — human-readable error signature string
+        • error_signature_hash    — SHA-256 hash of the error signature
+        • error_blocks            — list of enriched error block dicts
+        • primary_error           — most significant error block dict
+        • metadata                — enriched run/CI metadata
+        • model_tuning_params     — default generation hyperparameters
+
+        Model tuning parameters (Qwen-2.5-13B-Instruct defaults):
+          temperature=0.1, top_p=0.9, max_new_tokens=1024, repetition_penalty=1.1
+        """
+        processed = self.process(raw_log, metadata)
+
+        primary_dict: dict[str, Any] = {}
+        if processed.primary_error:
+            pb = processed.primary_error
+            primary_dict = {
+                "error_type": pb.error_type,
+                "error_message": pb.error_message,
+                "error_code": pb.error_code,
+                "stack_trace": pb.stack_trace,
+                "context_before": pb.context_before,
+                "context_after": pb.context_after,
+                "file_path": pb.file_path,
+                "line_number": pb.line_number,
+                "severity": pb.severity,
+                "impact_scope": pb.impact_scope,
+                "repository": pb.repository,
+                "language": pb.language,
+                "framework": pb.framework,
+                "ci_environment": pb.ci_environment,
+            }
+
+        error_blocks_list = [
+            {
+                "error_type": b.error_type,
+                "error_message": b.error_message,
+                "error_code": b.error_code,
+                "severity": b.severity,
+                "impact_scope": b.impact_scope,
+                "file_path": b.file_path,
+                "line_number": b.line_number,
+                "context_before": b.context_before[:5],
+                "context_after": b.context_after[:5],
+            }
+            for b in (processed.error_blocks or [])
+        ]
+
+        sig = processed.error_signature
+        emb = processed.embeddings
+
+        return {
+            "vectorized_error": emb.error_embedding if emb else [],
+            "vectorized_context": emb.context_embedding if emb else [],
+            "vectorized_combined": emb.combined_embedding if emb else [],
+            "error_signature": sig.readable if sig else "",
+            "error_signature_hash": sig.hash if sig else "",
+            "error_signature_components": sig.components if sig else {},
+            "error_blocks": error_blocks_list,
+            "primary_error": primary_dict,
+            "metadata": metadata,
+            "model_tuning_params": {
+                "temperature": 0.1,
+                "top_p": 0.9,
+                "max_new_tokens": 1024,
+                "repetition_penalty": 1.1,
+                "do_sample": False,
+            },
+        }
+
+    # ------------------------------------------------------------------
+    # Private helpers
+    # ------------------------------------------------------------------
+
+    def _identify_primary(self, blocks: list[ErrorBlock]) -> ErrorBlock | None:
+        """Return the highest-severity / most specific error block."""
+        if not blocks:
+            return None
+        severity_rank = {"high": 3, "critical": 4, "medium": 2, "low": 1}
+        return max(
+            blocks,
+            key=lambda b: (
+                severity_rank.get(b.severity, 0),
+                b.error_type not in {"unknown_error", "process_exit"},
+                bool(b.stack_trace),
+                bool(b.file_path),
+            ),
+        )
+
+    def _generate_embeddings(
+        self,
+        primary_error: ErrorBlock,
+        normalized_log: str,
+    ) -> EmbeddingResult:
+        """Generate three 384-dim embeddings (error / context / combined)."""
+        error_text = primary_error.error_message
+        context_text = "\n".join(
+            primary_error.context_before + [primary_error.error_message] + primary_error.context_after
+        )
+        combined_text = f"{error_text} {context_text}"
+
+        vecs = self.embedder.embed_batch([error_text, context_text, combined_text])
+        return EmbeddingResult(
+            error_embedding=vecs[0],
+            context_embedding=vecs[1],
+            combined_embedding=vecs[2],
+        )
+
+
+# ---------------------------------------------------------------------------
+# datetime import needed by ErrorBlockExtractor
+# ---------------------------------------------------------------------------
+from datetime import datetime, timezone  # noqa: E402 (placed here to avoid circular at top)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description="Pre-process collected GitHub Actions logs.")
     parser.add_argument("--data-dir", type=Path, default=DEFAULT_DATA_DIR, help="Data directory.")
@@ -1312,9 +1868,9 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--blocks-output", default="failure_blocks.jsonl")
     parser.add_argument("--graph-output", default="knowledge_graph.json")
     parser.add_argument("--dataset-output", default="training_dataset.jsonl")
-    parser.add_argument("--vector-db", type=Path, help="SQLite vector DB path. Defaults to data-dir/vector_store.sqlite.")
-    parser.add_argument("--skip-vector-db", action="store_true", help="Do not build the local vector DB.")
-    parser.add_argument("--append-vectors", action="store_true", help="Append to vector DB instead of replacing gha_logs.")
+    parser.add_argument("--vector-db", type=Path, help="ChromaDB persist directory. Defaults to data-dir/chroma_store.")
+    parser.add_argument("--skip-vector-db", action="store_true", help="Do not build the ChromaDB vector store.")
+    parser.add_argument("--append-vectors", action="store_true", help="Append to vector store instead of replacing ci_failure_logs.")
     parser.add_argument(
         "--kaggle-dataset-path",
         type=Path,
@@ -1363,7 +1919,7 @@ def main() -> int:
     args = parse_args()
     data_dir = args.data_dir.resolve()
     index_path = args.index or (data_dir / "index.json")
-    vector_db_path = args.vector_db or (data_dir / "vector_store.sqlite")
+    vector_db_path = args.vector_db or (data_dir / "chroma_store")
     kaggle_path = resolve_kaggle_dataset_path(args, data_dir)
     huggingface_path = resolve_huggingface_dataset_path(args, data_dir)
 
@@ -1456,11 +2012,11 @@ def main() -> int:
 
     vector_count = 0
     if not args.skip_vector_db:
-        vector_db = LocalVectorDB(vector_db_path)
+        vector_db = ChromaVectorDB(persist_dir=vector_db_path)
         try:
             if not args.append_vectors:
-                vector_db.clear_collection("gha_logs")
-            vector_count = vector_db.upsert_documents(vector_documents, collection="gha_logs")
+                vector_db.clear_collection("ci_failure_logs")
+            vector_count = vector_db.upsert_documents(vector_documents, collection="ci_failure_logs")
         finally:
             vector_db.close()
 
@@ -1476,7 +2032,7 @@ def main() -> int:
     print(f"Knowledge graph: {data_dir / args.graph_output}")
     if not args.skip_vector_db:
         print(f"Vector documents indexed: {vector_count}")
-        print(f"Vector DB: {vector_db_path}")
+        print(f"ChromaDB store: {vector_db_path}")
     return 0
 
 

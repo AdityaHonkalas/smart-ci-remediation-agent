@@ -31,6 +31,32 @@ DEFAULT_REPO = "kubernetes/kubernetes"
 DEFAULT_DATA_DIR = Path(__file__).resolve().parents[1] / "data"
 FAILURE_CONCLUSIONS = {"failure", "timed_out", "startup_failure"}
 
+# Forked repos for extracting controlled CI failures
+CONTROLLED_CI_ERROR_REPOS = [
+    "pandas",
+    "numpy",
+    "scikit-learn",
+    "pytest",
+    "django",
+    "requests",
+    "compose",
+    "cli",
+    "kubernetes",
+    "argo-cd",
+    "node"
+]
+
+# Repositories to extract runtime CI failure
+RUNTIME_CI_ERROR_REPOS = [
+    "kubernetes/kubernetes",
+    "apache/airflow",
+    "tensorflow/tensorflow",
+    "pytorch/pytorch",
+    "apache/spark",
+    "apache/kafka",
+    "elastic/elasticsearch",
+    "openshift/console"
+]
 
 def utc_now() -> str:
     return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
