@@ -1,6 +1,7 @@
 {
-  "schema_version": 1,
-  "description": "Regex patterns, error codes, and classification signals used to extract CI/CD failure blocks from GitHub Actions logs and Kaggle failure records.",
+  "schema_version": 2,
+  "description": "Hierarchical failure taxonomy, language-specific error patterns, workflow segmentation markers, and causal-ranking signals used by the redesigned CI failure extraction pipeline.",
+
   "noise_prefixes": [
     "requested labels:",
     "job is waiting for",
@@ -14,105 +15,218 @@
     "complete job name:",
     "cleanup."
   ],
-  "failure_block_end_pattern": {
-    "pattern": "^(?:Post job cleanup|Complete job|Finishing:|##\\[endgroup\\]|::endgroup::|Cleaning up|Uploading artifacts)",
-    "flags": [
-      "IGNORECASE"
-    ]
+
+  "workflow_step_markers": {
+    "step_start": {
+      "pattern": "^(?:##\\[group\\]|::group::)(?P<step_name>.+)$",
+      "flags": ["IGNORECASE"]
+    },
+    "step_end": {
+      "pattern": "^(?:##\\[endgroup\\]|::endgroup::)\\s*$",
+      "flags": ["IGNORECASE"]
+    },
+    "job_start": {
+      "pattern": "^(?:##\\[section\\]|::group::Running job:|Run (?:actions/|\\.))",
+      "flags": ["IGNORECASE"]
+    },
+    "command_run": {
+      "pattern": "^(?:##\\[command\\]|\\$\\s+|Run\\s+)",
+      "flags": ["IGNORECASE"]
+    }
   },
-  "failure_block_patterns": [
+
+  "failure_block_start_markers": [
     {
-      "name": "github_error_block",
+      "name": "github_annotation_error",
       "pattern": "(?:##\\[error\\]|::error\\b)",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "flags": ["IGNORECASE"],
+      "severity_tier": "critical",
+      "is_terminal": false
     },
     {
-      "name": "traceback_block",
-      "pattern": "Traceback \\(most recent call last\\):",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "name": "python_traceback_start",
+      "pattern": "^Traceback \\(most recent call last\\):",
+      "flags": ["IGNORECASE"],
+      "severity_tier": "high",
+      "is_terminal": false
+    },
+    {
+      "name": "java_exception_start",
+      "pattern": "^(?:Exception in thread \"[^\"]+\"|Caused by:|\\tat )",
+      "flags": [],
+      "severity_tier": "high",
+      "is_terminal": false
+    },
+    {
+      "name": "go_panic_start",
+      "pattern": "^(?:panic:|goroutine \\d+ \\[)",
+      "flags": ["IGNORECASE"],
+      "severity_tier": "critical",
+      "is_terminal": false
     },
     {
       "name": "test_failure_block",
-      "pattern": "^(?:--- FAIL:|FAIL:|FAILED\\s+|FAIL\\b|Error Trace:)",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "pattern": "^(?:--- FAIL:|FAIL:|FAILED\\s+|Error Trace:|FAILURES:|=+ FAILURES =+)",
+      "flags": ["IGNORECASE"],
+      "severity_tier": "high",
+      "is_terminal": false
     },
     {
       "name": "process_exit_block",
-      "pattern": "\\bprocess completed with exit code \\d+\\b",
-      "flags": [
-        "IGNORECASE"
-      ]
-    },
-    {
-      "name": "exception_block",
-      "pattern": "\\b(?:Exception|Error|AssertionError|TypeError|ReferenceError):\\s+",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "pattern": "\\bprocess completed with exit code (?!0\\b)\\d+\\b",
+      "flags": ["IGNORECASE"],
+      "severity_tier": "medium",
+      "is_terminal": true
     },
     {
       "name": "build_failure_block",
-      "pattern": "(?:make: \\*\\*\\*|compilation failed|build failed|failed to compile)",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "pattern": "(?:make: \\*\\*\\*|compilation failed|build failed|failed to compile|COMPILATION ERROR|BUILD FAILURE)",
+      "flags": ["IGNORECASE"],
+      "severity_tier": "high",
+      "is_terminal": false
     },
     {
       "name": "dependency_failure_block",
-      "pattern": "(?:npm ERR!|pip install .* failed|could not find a version|module not found|go: .*: module)",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "pattern": "(?:npm ERR!|pip install .* failed|could not find a version that satisfies|module not found|go: .*: module|error: package|Cannot resolve)",
+      "flags": ["IGNORECASE"],
+      "severity_tier": "high",
+      "is_terminal": false
     },
     {
       "name": "container_failure_block",
-      "pattern": "(?:failed to solve:|Dockerfile parse error|Cannot connect to the Docker daemon|ImagePullBackOff|CrashLoopBackOff)",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "pattern": "(?:failed to solve:|Dockerfile parse error|Cannot connect to the Docker daemon|ImagePullBackOff|CrashLoopBackOff|ErrImagePull)",
+      "flags": ["IGNORECASE"],
+      "severity_tier": "critical",
+      "is_terminal": false
     },
     {
       "name": "timeout_block",
       "pattern": "\\b(?:timed out|timeout|deadline exceeded|context deadline exceeded)\\b",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "flags": ["IGNORECASE"],
+      "severity_tier": "high",
+      "is_terminal": false
+    },
+    {
+      "name": "shell_error_block",
+      "pattern": "(?:^/bin/(?:bash|sh):|command not found|no such file or directory|permission denied|bad substitution)",
+      "flags": ["IGNORECASE"],
+      "severity_tier": "high",
+      "is_terminal": false
+    },
+    {
+      "name": "ruby_exception_start",
+      "pattern": "(?:^[A-Z][a-zA-Z]+Error|^[A-Z][a-zA-Z]+Exception):\\s+",
+      "flags": [],
+      "severity_tier": "high",
+      "is_terminal": false
     }
   ],
+
+  "failure_block_end_markers": [
+    {
+      "name": "workflow_cleanup",
+      "pattern": "^(?:Post job cleanup|Complete job|Finishing:|##\\[endgroup\\]|::endgroup::|Cleaning up|Uploading artifacts)",
+      "flags": ["IGNORECASE"],
+      "terminates_all": true
+    },
+    {
+      "name": "job_failed_terminal",
+      "pattern": "^(?:##\\[error\\]The process .* failed with exit code|Error: Process completed with exit code)",
+      "flags": ["IGNORECASE"],
+      "terminates_all": false,
+      "is_cascade_noise": true
+    },
+    {
+      "name": "section_boundary",
+      "pattern": "^(?:##\\[group\\]|::group::)(?!.*(?:error|fail|exception|traceback))",
+      "flags": ["IGNORECASE"],
+      "terminates_all": false
+    }
+  ],
+
+  "failure_block_end_pattern": {
+    "pattern": "^(?:Post job cleanup|Complete job|Finishing:|##\\[endgroup\\]|::endgroup::|Cleaning up|Uploading artifacts)",
+    "flags": ["IGNORECASE"]
+  },
+
+  "failure_block_patterns": [
+    {
+      "name": "github_error_block",
+      "pattern": "(?:##\\[error\\]|::error\\b)",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "traceback_block",
+      "pattern": "Traceback \\(most recent call last\\):",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "java_exception_block",
+      "pattern": "^(?:Exception in thread|Caused by:|\\tat [a-zA-Z])",
+      "flags": []
+    },
+    {
+      "name": "test_failure_block",
+      "pattern": "^(?:--- FAIL:|FAIL:|FAILED\\s+|FAIL\\b|Error Trace:|=+ FAILURES =+|FAILURES:)",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "process_exit_block",
+      "pattern": "\\bprocess completed with exit code \\d+\\b",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "exception_block",
+      "pattern": "\\b(?:Exception|Error|AssertionError|TypeError|ReferenceError|ValueError|KeyError|IndexError|AttributeError|ImportError|RuntimeError|OSError|IOError|NameError|SyntaxError|NotImplementedError):\\s+",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "build_failure_block",
+      "pattern": "(?:make: \\*\\*\\*|compilation failed|build failed|failed to compile|BUILD FAILURE|COMPILATION ERROR)",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "dependency_failure_block",
+      "pattern": "(?:npm ERR!|pip install .* failed|could not find a version|module not found|go: .*: module|Cannot resolve|error: package)",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "container_failure_block",
+      "pattern": "(?:failed to solve:|Dockerfile parse error|Cannot connect to the Docker daemon|ImagePullBackOff|CrashLoopBackOff|ErrImagePull)",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "timeout_block",
+      "pattern": "\\b(?:timed out|timeout|deadline exceeded|context deadline exceeded)\\b",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "shell_error_block",
+      "pattern": "(?:command not found|no such file or directory|bad substitution|/bin/bash:|/bin/sh:)",
+      "flags": ["IGNORECASE"]
+    }
+  ],
+
   "error_patterns": [
     {
       "name": "github_annotation_error",
       "pattern": "::error\\b.*?(?:::|message=)(?P<message>.+)$",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "flags": ["IGNORECASE"]
     },
     {
       "name": "process_exit_code",
       "pattern": "\\bprocess completed with exit code (?P<exit_code>\\d+)\\b",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "flags": ["IGNORECASE"]
     },
     {
       "name": "exit_status",
       "pattern": "\\b(?:exit status|exited with code|exit code)\\s+(?P<exit_code>\\d+)\\b",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "flags": ["IGNORECASE"]
     },
     {
       "name": "http_status",
       "pattern": "\\b(?:HTTP|status(?: code)?)\\s*(?P<http_status>[45]\\d{2})\\b",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "flags": ["IGNORECASE"]
     },
     {
       "name": "errno",
@@ -121,77 +235,233 @@
     {
       "name": "go_test_failure",
       "pattern": "^(?:--- FAIL:|FAIL\\b|panic:|fatal error:)",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "go_build_error",
+      "pattern": "^(?:[\\w./]+\\.go:\\d+:\\d+:\\s+)",
+      "flags": []
+    },
+    {
+      "name": "python_traceback",
+      "pattern": "^Traceback \\(most recent call last\\):",
+      "flags": ["IGNORECASE"]
     },
     {
       "name": "python_failure",
-      "pattern": "(?:Traceback \\(most recent call last\\):|AssertionError|pytest(?:.+)failed|FAILED\\s+.+\\.py)",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "pattern": "(?:Traceback \\(most recent call last\\):|AssertionError|pytest(?:.+)failed|FAILED\\s+.+\\.py|ModuleNotFoundError|ImportError|SyntaxError|IndentationError|NameError|AttributeError|KeyError|ValueError|TypeError|RuntimeError|OSError|FileNotFoundError|PermissionError|TimeoutError)",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "java_exception",
+      "pattern": "(?:^Exception in thread \"[^\"]+\"|^Caused by:\\s+[A-Za-z.]+Exception|^\\tat [a-zA-Z][\\w.$]+\\.[a-zA-Z][\\w$]+\\(|java\\.lang\\.[A-Z][a-zA-Z]+Exception|java\\.io\\.[A-Z][a-zA-Z]+Exception|org\\.springframework\\.[A-Za-z.]+Exception|NullPointerException|ClassNotFoundException|NoSuchMethodException|IllegalArgumentException|IllegalStateException|ArrayIndexOutOfBoundsException|StackOverflowError|OutOfMemoryError)",
+      "flags": []
+    },
+    {
+      "name": "java_build_error",
+      "pattern": "(?:\\[ERROR\\].*\\.java:\\[\\d+,\\d+\\]|error: cannot find symbol|error: package .* does not exist|COMPILATION ERROR|\\d+ error(?:s)?)",
+      "flags": ["IGNORECASE"]
     },
     {
       "name": "javascript_failure",
-      "pattern": "(?:npm ERR!|yarn (?:run )?v?\\d*.*error|pnpm ERR!|Jest.*failed|TypeError:|ReferenceError:)",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "pattern": "(?:npm ERR!|yarn (?:run )?v?\\d*.*error|pnpm ERR!|Jest.*failed|TypeError:|ReferenceError:|SyntaxError:|UnhandledPromiseRejection|Cannot find module|Module not found)",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "typescript_error",
+      "pattern": "(?:TS\\d{4}:|error TS\\d+:|Type .* is not assignable|Cannot find name|Property .* does not exist on type)",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "ruby_exception",
+      "pattern": "(?:^[A-Z][a-zA-Z]+Error:|^[A-Z][a-zA-Z]+Exception:|\\(LoadError\\)|\\(NameError\\)|\\(NoMethodError\\)|\\(ArgumentError\\)|Bundler::GemNotFound|rake aborted)",
+      "flags": []
+    },
+    {
+      "name": "shell_command_error",
+      "pattern": "(?:command not found|No such file or directory|Permission denied|bad substitution|syntax error near unexpected token|/bin/(?:bash|sh):\\s+\\d+:|illegal option)",
+      "flags": ["IGNORECASE"]
+    },
+    {
+      "name": "makefile_error",
+      "pattern": "(?:make\\[?\\d*\\]?:\\s+\\*\\*\\*|make: \\*\\*\\*|Error \\d+|Stop\\.)",
+      "flags": ["IGNORECASE"]
     },
     {
       "name": "docker_failure",
-      "pattern": "(?:docker: Error response from daemon|Cannot connect to the Docker daemon|denied: requested access|failed to solve:|image pull)",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "pattern": "(?:docker: Error response from daemon|Cannot connect to the Docker daemon|denied: requested access|failed to solve:|image pull|unauthorized: authentication required|manifest unknown)",
+      "flags": ["IGNORECASE"]
     },
     {
       "name": "kubernetes_failure",
-      "pattern": "(?:Error from server \\((?P<k8s_reason>[^)]+)\\)|CrashLoopBackOff|ImagePullBackOff|CreateContainerConfigError|CreateContainerError|OOMKilled|DeadlineExceeded|Back-off restarting failed container)",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "pattern": "(?:Error from server \\((?P<k8s_reason>[^)]+)\\)|CrashLoopBackOff|ImagePullBackOff|CreateContainerConfigError|CreateContainerError|OOMKilled|DeadlineExceeded|Back-off restarting failed container|Evicted|Pending|Unknown)",
+      "flags": ["IGNORECASE"]
     },
     {
       "name": "timeout",
-      "pattern": "\\b(?:timed out|timeout|deadline exceeded|context deadline exceeded)\\b",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "pattern": "\\b(?:timed out|timeout|deadline exceeded|context deadline exceeded|ETIMEDOUT)\\b",
+      "flags": ["IGNORECASE"]
     },
     {
       "name": "generic_error",
       "pattern": "\\b(?:ERROR|FATAL|Exception|failed|failure|cannot|unable to)\\b",
-      "flags": [
-        "IGNORECASE"
-      ]
+      "flags": ["IGNORECASE"]
     }
   ],
+
+  "terminal_noise_patterns": [
+    {
+      "name": "job_failed_terminal",
+      "pattern": "^(?:##\\[error\\]The process .* failed with exit code|Error: Process completed with exit code|##\\[error\\].*job failed)",
+      "flags": ["IGNORECASE"],
+      "reason": "Terminal wrapper message – not the root cause"
+    },
+    {
+      "name": "step_failed_terminal",
+      "pattern": "^(?:##\\[error\\].*step.*failed|##\\[error\\].*action.*failed)",
+      "flags": ["IGNORECASE"],
+      "reason": "Step-level wrapper – not the root cause"
+    },
+    {
+      "name": "generic_exit_only",
+      "pattern": "^(?:Process completed with exit code (?!0\\b)\\d+)$",
+      "flags": ["IGNORECASE"],
+      "reason": "Bare exit code line with no additional context"
+    }
+  ],
+
+  "failure_taxonomy": {
+    "description": "Hierarchical severity taxonomy. Each tier maps to error types. Used by HierarchicalSeverityScorer.",
+    "tiers": {
+      "critical": {
+        "score": 100,
+        "error_types": [
+          "oom_error",
+          "kernel_panic",
+          "segfault",
+          "infrastructure_failure",
+          "kubernetes_error",
+          "container_error"
+        ]
+      },
+      "high": {
+        "score": 75,
+        "error_types": [
+          "build_error",
+          "dependency_error",
+          "configuration_error",
+          "java_exception",
+          "python_exception",
+          "permission_error",
+          "network_error"
+        ]
+      },
+      "medium": {
+        "score": 50,
+        "error_types": [
+          "test_failure",
+          "timeout",
+          "resource_error",
+          "shell_error",
+          "javascript_error",
+          "typescript_error",
+          "ruby_error"
+        ]
+      },
+      "low": {
+        "score": 25,
+        "error_types": [
+          "process_exit",
+          "unknown_error",
+          "generic_error",
+          "warning"
+        ]
+      }
+    },
+    "root_cause_types": [
+      "build_error",
+      "dependency_error",
+      "configuration_error",
+      "permission_error",
+      "network_error",
+      "resource_error",
+      "oom_error",
+      "kubernetes_error",
+      "container_error",
+      "infrastructure_failure",
+      "java_exception",
+      "python_exception",
+      "shell_error"
+    ],
+    "cascading_types": [
+      "unknown_error",
+      "generic_error",
+      "process_exit",
+      "test_failure"
+    ],
+    "terminal_noise_types": [
+      "process_exit",
+      "generic_error"
+    ]
+  },
+
+  "stack_trace_patterns": {
+    "python": {
+      "frame_pattern": "^\\s+File \"(?P<file>[^\"]+)\", line (?P<line>\\d+), in (?P<func>\\S+)",
+      "flags": ["IGNORECASE"]
+    },
+    "java": {
+      "frame_pattern": "^\\s+at (?P<class>[\\w.$]+)\\.(?P<method>[\\w$<>]+)\\((?P<file>[^)]+)\\)",
+      "flags": []
+    },
+    "go": {
+      "frame_pattern": "^(?P<func>[\\w./]+)\\((?:[^)]+)\\)\\s*$",
+      "flags": []
+    },
+    "javascript": {
+      "frame_pattern": "^\\s+at (?P<func>[^(]+)\\s*\\((?P<file>[^)]+)\\)",
+      "flags": []
+    },
+    "ruby": {
+      "frame_pattern": "^\\s+from (?P<file>[^:]+):(?P<line>\\d+):in `(?P<method>[^']+)'",
+      "flags": []
+    }
+  },
+
   "classification_signals": {
     "kubernetes_error": [
       "crashloopbackoff",
       "imagepullbackoff",
+      "errimagepull",
       "error from server",
       "pod ",
-      "kubectl"
+      "kubectl",
+      "oomkilled",
+      "createcontainerconfigerror"
     ],
     "container_error": [
       "docker",
-      "container"
+      "container",
+      "dockerfile",
+      "failed to solve",
+      "manifest unknown",
+      "denied: requested access"
     ],
     "permission_error": [
       "permission denied",
       "forbidden",
       "unauthorized",
       "eacces",
-      "eperm"
+      "eperm",
+      "403",
+      "access denied"
     ],
     "timeout": [
       "timed out",
       "timeout",
       "deadline exceeded",
-      "etimedout"
+      "etimedout",
+      "operation timed out"
     ],
     "network_error": [
       "connection refused",
@@ -201,79 +471,158 @@
       "no route to host",
       "could not resolve",
       "econnreset",
-      "econnrefused"
+      "econnrefused",
+      "name resolution failure",
+      "ssl",
+      "certificate"
     ],
     "resource_error": [
       "oomkilled",
       "out of memory",
       "no space left",
       "disk quota",
-      "cannot allocate memory"
+      "cannot allocate memory",
+      "resource exhausted",
+      "quota exceeded"
     ],
     "test_failure": [
       "assertionerror",
       "--- fail:",
       "test failed",
       "failed tests",
+      "assertion failed",
       "expected",
-      "actual"
+      "actual",
+      "jest",
+      "pytest",
+      "rspec"
     ],
     "dependency_error": [
       "module not found",
       "cannot find module",
       "npm err!",
       "go: module",
-      "no matching distribution"
+      "no matching distribution",
+      "could not find a version",
+      "cannot resolve",
+      "bundler::gemnotfound",
+      "error: package"
     ],
     "build_error": [
       "syntax error",
       "compilation failed",
       "build failed",
       "make:",
-      "compiler"
+      "compiler",
+      "build failure",
+      "compilation error",
+      "cannot find symbol",
+      "does not exist"
     ],
     "configuration_error": [
       "yaml",
       "invalid configuration",
       "missing required",
       "secret not found",
-      "unknown flag"
+      "unknown flag",
+      "invalid value",
+      "not a valid",
+      "malformed"
+    ],
+    "java_exception": [
+      "exception in thread",
+      "caused by:",
+      "nullpointerexception",
+      "classnotfoundexception",
+      "nosuchmethodexception",
+      "java.lang",
+      "java.io",
+      "org.springframework",
+      "stackoverflowerror",
+      "outofmemoryerror"
+    ],
+    "python_exception": [
+      "traceback (most recent call last)",
+      "modulenotfounderror",
+      "importerror",
+      "syntaxerror",
+      "indentationerror",
+      "nameerror",
+      "attributeerror",
+      "keyerror",
+      "valueerror",
+      "typeerror",
+      "runtimeerror",
+      "oserror",
+      "filenotfounderror"
+    ],
+    "shell_error": [
+      "command not found",
+      "no such file or directory",
+      "bad substitution",
+      "/bin/bash",
+      "/bin/sh",
+      "illegal option",
+      "syntax error near unexpected token"
     ]
   },
+
   "error_code_signals": {
-    "TIMEOUT": [
-      "deadline exceeded",
-      "timed out",
-      "timeout"
-    ],
-    "OOM": [
-      "oomkilled",
-      "out of memory"
-    ],
-    "PERMISSION_DENIED": [
-      "permission denied"
-    ],
-    "CONNECTION_REFUSED": [
-      "connection refused"
-    ],
-    "CONNECTION_RESET": [
-      "connection reset"
-    ]
+    "TIMEOUT": ["deadline exceeded", "timed out", "timeout", "etimedout"],
+    "OOM": ["oomkilled", "out of memory", "outofmemoryerror"],
+    "PERMISSION_DENIED": ["permission denied", "eacces", "eperm", "403", "forbidden"],
+    "CONNECTION_REFUSED": ["connection refused", "econnrefused"],
+    "CONNECTION_RESET": ["connection reset", "econnreset"],
+    "MODULE_NOT_FOUND": ["module not found", "cannot find module", "modulenotfounderror"],
+    "COMPILATION_FAILED": ["compilation failed", "build failed", "compilation error"],
+    "DISK_FULL": ["no space left", "disk quota", "quota exceeded"],
+    "TLS_ERROR": ["tls handshake", "certificate", "ssl"],
+    "DNS_FAILURE": ["could not resolve", "name resolution failure", "no route to host"]
   },
+
   "severity_signals": {
     "high_tokens": [
       "fatal",
       "panic",
       "traceback",
-      "oomkilled"
+      "oomkilled",
+      "segfault",
+      "kernel panic",
+      "critical",
+      "exception in thread",
+      "build failure",
+      "compilation error"
     ],
     "medium_error_types": [
       "timeout",
-      "resource_error"
+      "resource_error",
+      "test_failure",
+      "shell_error"
     ],
     "medium_error_code_prefixes": [
       "EXIT_",
-      "HTTP_5"
+      "HTTP_5",
+      "OOM",
+      "TIMEOUT"
     ]
-  }
+  },
+
+  "causal_link_patterns": {
+    "caused_by": {
+      "pattern": "(?:caused by|due to|because|reason:|root cause:|resulted in)",
+      "flags": ["IGNORECASE"]
+    },
+    "triggered_by": {
+      "pattern": "(?:triggered by|called from|spawned by|initiated by)",
+      "flags": ["IGNORECASE"]
+    },
+    "dependency_chain": {
+      "pattern": "(?:required by|depends on|imported by|used by)",
+      "flags": ["IGNORECASE"]
+    }
+  },
+
+  "semantic_similarity_threshold": 0.85,
+  "causal_window_lines": 15,
+  "max_stack_trace_depth": 50
 }

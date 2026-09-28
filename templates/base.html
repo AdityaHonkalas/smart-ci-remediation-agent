@@ -1,0 +1,33 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{% block title %}Smart CI Remediation{% endblock %}</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+  <!-- Chart.js — used by stats.html and evaluation.html -->
+  <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.3/dist/chart.umd.min.js"></script>
+  {% block head_extra %}{% endblock %}
+</head>
+<body>
+
+<header>
+  <span class="header-brand">
+    <span class="header-title">Smart CI Remediation</span>
+    <span class="tagline">Multi-agent RCA · Fix Recommendations · Web Search</span>
+  </span>
+  <nav class="header-nav">
+    <a href="/" class="nav-link {% if request.path == '/' %}nav-active{% endif %}">Home</a>
+    <a href="/stats" class="nav-link {% if request.path == '/stats' %}nav-active{% endif %}">Statistics</a>
+    <a href="/evaluation" class="nav-link {% if request.path == '/evaluation' %}nav-active{% endif %}">Evaluation</a>
+  </nav>
+</header>
+
+{% block content %}{% endblock %}
+
+<footer class="site-footer">
+  Smart CI Remediation Agent &mdash; Dissertation Project
+</footer>
+
+</body>
+</html>

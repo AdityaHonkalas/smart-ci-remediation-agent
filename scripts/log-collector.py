@@ -161,7 +161,7 @@ class GitHubActionsClient:
             "User-Agent": "smart-ci-remediation-agent",
         }
         if token:
-            self.headers["Authorization"] = f"Bearer {token}"
+            self.headers["Authorization"] = f"token {token}"
 
     def request_json(
         self,
@@ -198,12 +198,75 @@ class GitHubActionsClient:
             if len(items) < per_page:
                 break
 
+    def post_json(
+        self,
+        path: str,
+        body: dict[str, Any],
+    ) -> dict[str, Any]:
+        """POST a JSON body to a GitHub API endpoint and return the parsed response."""
+        import json as _json  # stdlib — already imported at module level, kept local for clarity
+        url     = f"{self.api_url}/{path.lstrip('/')}"
+        data    = _json.dumps(body).encode("utf-8")
+        headers = {**self.headers, "Content-Type": "application/json"}
+        request = urllib.request.Request(url, data=data, headers=headers, method="POST")
+        try:
+            with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
+                return _json.loads(response.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            err_body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(
+                f"GitHub API POST error {exc.code} for {url}: {err_body}"
+            ) from exc
+
     def download_bytes(self, url: str) -> bytes:
         request = urllib.request.Request(url, headers=self.headers)
         try:
             with urllib.request.urlopen(request, timeout=self.timeout_seconds) as response:
                 return response.read()
         except urllib.error.HTTPError as exc:
+            body = exc.read().decode("utf-8", errors="replace")
+            raise RuntimeError(f"GitHub log download error {exc.code}: {body}") from exc
+
+    def download_bytes_no_redirect_auth(self, url: str) -> bytes:
+        """Download bytes where the URL may redirect to a third-party storage host.
+
+        GitHub job-log endpoints return a 302 redirect to a pre-signed Azure
+        Blob Storage URL.  Forwarding the ``Authorization: Bearer`` header to
+        Azure causes a 401 ``InvalidAuthenticationInfo`` error because Azure
+        interprets it as a conflicting credential.
+
+        This method resolves the redirect manually: the initial GET is sent
+        with GitHub auth headers, and any redirect URL is then fetched without
+        the Authorization header so the pre-signed URL can authenticate on its
+        own.
+        """
+        # Disable automatic redirect following so we can intercept the Location.
+        class _NoRedirect(urllib.request.HTTPRedirectHandler):
+            def redirect_request(self, req, fp, code, msg, headers, newurl):  # type: ignore[override]
+                return None
+
+        opener = urllib.request.build_opener(_NoRedirect)
+        req = urllib.request.Request(url, headers=self.headers)
+        try:
+            with opener.open(req, timeout=self.timeout_seconds) as response:
+                return response.read()
+        except urllib.error.HTTPError as exc:
+            if exc.code in (301, 302, 303, 307, 308):
+                redirect_url = exc.headers.get("Location")
+                if redirect_url:
+                    # Fetch the redirect target without the GitHub Authorization
+                    # header so pre-signed storage URLs are not disrupted.
+                    storage_req = urllib.request.Request(redirect_url)
+                    try:
+                        with urllib.request.urlopen(
+                            storage_req, timeout=self.timeout_seconds
+                        ) as storage_resp:
+                            return storage_resp.read()
+                    except urllib.error.HTTPError as storage_exc:
+                        body = storage_exc.read().decode("utf-8", errors="replace")
+                        raise RuntimeError(
+                            f"GitHub log download error {storage_exc.code}: {body}"
+                        ) from storage_exc
             body = exc.read().decode("utf-8", errors="replace")
             raise RuntimeError(f"GitHub log download error {exc.code}: {body}") from exc
 
@@ -365,17 +428,108 @@ def download_run_zip(
     return DownloadResult(zip_path=zip_path, size_bytes=len(archive_bytes), source_format=source_format)
 
 
+def download_failed_job_log(
+    client: GitHubActionsClient,
+    repo: str,
+    jobs: list[dict[str, Any]],
+    output_dir: Path,
+    overwrite: bool = True,
+) -> DownloadResult:
+    """Download the log for the first job whose conclusion is a failure.
+
+    The GitHub API endpoint ``GET /repos/{repo}/actions/jobs/{job_id}/logs``
+    returns the raw log text for a single job.  We wrap that text into a zip
+    archive so the pre-processing pipeline can consume it with the same
+    ``process_zip`` code path it already uses for run-level archives.
+
+    The resulting zip contains a single member named
+    ``failed_job_{job_id}.log`` so that :func:`infer_job_name` in the
+    pre-processing pipeline can associate it with the correct job.
+
+    Parameters
+    ----------
+    client:
+        Authenticated GitHub API client.
+    repo:
+        ``owner/repo`` string.
+    jobs:
+        Job list returned by :func:`list_jobs_for_run`.  Jobs are inspected
+        in order; the first one whose ``conclusion`` is in
+        :data:`FAILURE_CONCLUSIONS` wins.
+    output_dir:
+        Directory where the zip file will be written.
+    overwrite:
+        Re-download even if the file already exists on disk.
+
+    Returns
+    -------
+    DownloadResult
+        ``zip_path`` is *None* and ``error`` is set when no failed job is
+        found or the download fails.
+    """
+    failed_job = next(
+        (j for j in jobs if j.get("conclusion") in FAILURE_CONCLUSIONS),
+        None,
+    )
+    if failed_job is None:
+        return DownloadResult(zip_path=None, size_bytes=0, error="No failed job found in job list")
+
+    job_id = failed_job["id"]
+    job_name = failed_job.get("name") or f"job-{job_id}"
+    filename = f"{safe_repo_name(repo)}_failed_job-{job_id}.zip"
+    zip_path = output_dir / filename
+
+    if zip_path.exists() and not overwrite:
+        return DownloadResult(
+            zip_path=zip_path,
+            size_bytes=zip_path.stat().st_size,
+            source_format="failed_job_zip",
+        )
+
+    log_url = client._build_url(f"/repos/{repo}/actions/jobs/{job_id}/logs")
+    try:
+        # Use redirect-aware download: GitHub returns a 302 to a pre-signed
+        # Azure Blob URL and the Authorization header must NOT be forwarded.
+        raw_log_bytes = client.download_bytes_no_redirect_auth(log_url)
+    except Exception as exc:  # noqa: BLE001
+        return DownloadResult(zip_path=None, size_bytes=0, error=str(exc))
+
+    # Wrap the raw log text into a zip so process_zip can handle it uniformly.
+    output = io.BytesIO()
+    safe_name = job_name.replace("/", "_").replace(" ", "_")
+    with zipfile.ZipFile(output, mode="w", compression=zipfile.ZIP_DEFLATED) as archive:
+        archive.writestr(f"failed_job_{safe_name}_{job_id}.log", raw_log_bytes)
+    archive_bytes = output.getvalue()
+
+    output_dir.mkdir(parents=True, exist_ok=True)
+    zip_path.write_bytes(archive_bytes)
+    return DownloadResult(
+        zip_path=zip_path,
+        size_bytes=len(archive_bytes),
+        source_format="failed_job_zip",
+    )
+
+
 def compact_run_metadata(
     repo: str,
     run: dict[str, Any],
     jobs: list[dict[str, Any]],
     download: DownloadResult,
     data_dir: Path,
+    failed_job_download: DownloadResult | None = None,
 ) -> dict[str, Any]:
     head_commit = run.get("head_commit") or {}
     zip_path = None
     if download.zip_path:
         zip_path = download.zip_path.resolve().relative_to(data_dir.resolve()).as_posix()
+
+    failed_job_zip_path = None
+    if failed_job_download and failed_job_download.zip_path:
+        failed_job_zip_path = (
+            failed_job_download.zip_path.resolve()
+            .relative_to(data_dir.resolve())
+            .as_posix()
+        )
 
     return {
         "repository": repo,
@@ -400,6 +554,9 @@ def compact_run_metadata(
         "zip_size_bytes": download.size_bytes,
         "zip_source_format": download.source_format,
         "download_error": download.error,
+        "failed_job_zip_path": failed_job_zip_path,
+        "failed_job_zip_size_bytes": failed_job_download.size_bytes if failed_job_download else 0,
+        "failed_job_download_error": failed_job_download.error if failed_job_download else None,
         "collected_at": utc_now(),
     }
 
@@ -493,7 +650,7 @@ def parse_args() -> argparse.Namespace:
         help="Directory where logs and index.json are stored.",
     )
     parser.add_argument("--index-name", default="index.json", help="Index file name under data-dir.")
-    parser.add_argument("--token", default=os.getenv("GITHUB_TOKEN"), help="GitHub token.")
+    parser.add_argument("--token", default=os.getenv("GITHUB_ACCESS_TOKEN"), help="GitHub token.")
     parser.add_argument("--overwrite", action="store_true", help="Re-download existing zip files.")
     parser.add_argument(
         "--sleep-seconds",

@@ -1,0 +1,114 @@
+{% extends "base.html" %}
+{% block title %}Statistical Analysis — Smart CI Remediation{% endblock %}
+
+{% block content %}
+<main class="report-main">
+
+  <div class="report-header">
+    <h1>Statistical Analysis</h1>
+    <p>CI failure patterns, fix outcomes, and knowledge base growth — sourced from ChromaDB, batch diagnosis archive, and feedback history.</p>
+    <p id="data-note" style="margin-top:6px; font-style:italic; color: var(--muted); font-size:12px;"></p>
+  </div>
+
+  <!-- 10 Chart Grid -->
+  <div class="chart-grid">
+
+    <div class="chart-card">
+      <h3>Top Error Types by Frequency</h3>
+      <p class="chart-subtitle">Most frequently encountered CI failure categories (ChromaDB RCA KB)</p>
+      <canvas id="chart-error-types"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Fix Applicability by Error Type</h3>
+      <p class="chart-subtitle">Applicable vs blocked vs manual-review fixes across 26 batch diagnosis runs</p>
+      <canvas id="chart-fix-applicability"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>RCA Confidence Distribution (KB)</h3>
+      <p class="chart-subtitle">Distribution of confidence scores across all stored RCA diagnoses in ChromaDB</p>
+      <canvas id="chart-confidence-dist"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Severity Breakdown</h3>
+      <p class="chart-subtitle">High / Medium / Low severity ratio from CI failure log chunks</p>
+      <canvas id="chart-severity"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Fix Source Distribution</h3>
+      <p class="chart-subtitle">LLM-generated vs historical KB vs template fix candidates across all diagnosis runs</p>
+      <canvas id="chart-fix-source-archive"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Error Frequency by Repository</h3>
+      <p class="chart-subtitle">Top repositories by failure count in the log store</p>
+      <canvas id="chart-repo-freq"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>RCA Confidence Score Distribution (Archive)</h3>
+      <p class="chart-subtitle">Distribution of per-run confidence scores from 26 batch diagnosis runs</p>
+      <canvas id="chart-rca-conf-hist"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Error Type &times; Severity Matrix</h3>
+      <p class="chart-subtitle">Cross-tabulation of error type and severity (risk matrix)</p>
+      <canvas id="chart-error-severity-matrix"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Fix Acceptance Rate by Fix Type</h3>
+      <p class="chart-subtitle">Success rate per fix category from feedback history (grows with live usage)</p>
+      <canvas id="chart-fix-acceptance-stats"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Knowledge Base Growth Curve</h3>
+      <p class="chart-subtitle">Cumulative RCA entries added to ChromaDB over time</p>
+      <canvas id="chart-kb-growth"></canvas>
+    </div>
+
+  </div><!-- /.chart-grid -->
+</main>
+
+<script src="{{ url_for('static', filename='js/charts.js') }}"></script>
+<script>
+(async function () {
+  let data;
+  try {
+    const resp = await fetch('/api/stats/summary');
+    if (!resp.ok) throw new Error('API returned ' + resp.status);
+    data = await resp.json();
+  } catch (err) {
+    document.getElementById('data-note').textContent =
+      'Failed to load statistics: ' + err.message;
+    return;
+  }
+
+  // Show data point counts
+  const totalPts = data.total_data_points ?? 0;
+  document.getElementById('data-note').textContent =
+    `Based on ${data.rca_data_points ?? 0} RCA KB records, ` +
+    `${data.log_data_points ?? 0} log chunks, ` +
+    `${data.archive_data_points ?? 0} batch diagnosis runs, ` +
+    `${data.fix_data_points ?? 0} fix feedback entries.` +
+    (totalPts === 0 ? ' Run the diagnosis pipeline to populate data.' : '');
+
+  renderErrorTypeBar(data.error_type_counts);
+  renderFixApplicabilityByType(data.fix_applicability_by_type);
+  renderConfidenceHistogram(data.confidence_histogram);
+  renderSeverityDonut(data.severity_counts);
+  renderFixSourceArchive(data.fix_source_archive);
+  renderRepoFrequencyBar(data.repo_freq);
+  renderRcaConfidenceHistogram(data.rca_confidence_hist_archive);
+  renderErrorSeverityMatrix(data.error_severity_matrix);
+  renderFixAcceptanceStatsBar(data.fix_acceptance_rate);
+  renderKbGrowthLine(data.kb_growth);
+})();
+</script>
+{% endblock %}

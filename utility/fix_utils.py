@@ -50,11 +50,12 @@ class FixCandidate:
     specificity:      float = 0.0
     implementation_ease: float = 0.0
     # Validation
-    is_applicable:    bool = True
-    has_blockers:     bool = False
-    warnings:         list[str] = field(default_factory=list)
-    side_effects:     list[str] = field(default_factory=list)
-    estimated_effort: str = "medium"
+    is_applicable:          bool = True
+    has_blockers:           bool = False
+    requires_manual_review: bool = False
+    warnings:               list[str] = field(default_factory=list)
+    side_effects:           list[str] = field(default_factory=list)
+    estimated_effort:       str = "medium"
     # Final
     rank:             int  = 0
     final_score:      float = 0.0

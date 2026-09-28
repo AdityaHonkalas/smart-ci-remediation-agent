@@ -5,305 +5,1604 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Smart CI Remediation</title>
   <style>
+    /* ── Design tokens ─────────────────────────────────────────────────── */
     :root {
       color-scheme: light;
-      --ink: #17202a;
-      --muted: #5d6b78;
-      --line: #d7dee6;
-      --panel: #ffffff;
-      --page: #f4f7fb;
-      --accent: #087f8c;
-      --accent-dark: #075f68;
-      --danger: #b42318;
-      --ok: #146c43;
+      --ink:          #17202a;
+      --muted:        #5d6b78;
+      --line:         #d7dee6;
+      --panel:        #ffffff;
+      --page:         #f4f7fb;
+      --surface:      #f7f8fa;
+      --accent:       #087f8c;
+      --accent-dark:  #075f68;
+      --accent-light: #e6f4f5;
+      --danger:       #b42318;
+      --danger-light: #fef2f2;
+      --warn:         #92400e;
+      --warn-light:   #fffbeb;
+      --ok:           #146c43;
+      --ok-light:     #ecfdf5;
+      --purple:       #5b21b6;
+      --purple-light: #f5f3ff;
+      --blue:         #1d4ed8;
+      --blue-light:   #eff6ff;
     }
-    * { box-sizing: border-box; }
+    /* ── Reset / Base ──────────────────────────────────────────────────── */
+    * { box-sizing: border-box; margin: 0; padding: 0; }
     body {
-      margin: 0;
-      font-family: Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      font-family: Inter, ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+      font-size: 14px;
+      line-height: 1.6;
       color: var(--ink);
       background: var(--page);
     }
+    a { color: var(--accent); text-decoration: none; }
+    a:hover { text-decoration: underline; }
+    /* ── Layout ────────────────────────────────────────────────────────── */
     header {
-      padding: 24px 32px 18px;
+      padding: 20px 32px 16px;
       border-bottom: 1px solid var(--line);
       background: #fff;
+      display: flex;
+      align-items: baseline;
+      gap: 16px;
     }
-    h1 {
-      margin: 0;
-      font-size: clamp(24px, 4vw, 38px);
+    header h1 {
+      font-size: clamp(20px, 3vw, 28px);
       font-weight: 760;
-      letter-spacing: 0;
+    }
+    header .tagline {
+      color: var(--muted);
+      font-size: 13px;
     }
     main {
-      width: min(1180px, calc(100vw - 32px));
-      margin: 24px auto 48px;
+      width: min(1260px, calc(100vw - 32px));
+      margin: 24px auto 64px;
       display: grid;
-      grid-template-columns: minmax(320px, 440px) 1fr;
+      grid-template-columns: minmax(300px, 400px) 1fr;
       gap: 20px;
       align-items: start;
     }
-    section, form {
+    /* ── Form card ─────────────────────────────────────────────────────── */
+    .form-card {
       background: var(--panel);
       border: 1px solid var(--line);
-      border-radius: 8px;
-    }
-    form {
-      padding: 18px;
+      border-radius: 10px;
+      padding: 20px;
       display: grid;
-      gap: 14px;
+      gap: 16px;
+      position: sticky;
+      top: 16px;
+    }
+    .form-card h2 {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--ink);
     }
     label {
       display: grid;
-      gap: 7px;
+      gap: 6px;
+      font-size: 12px;
+      font-weight: 700;
       color: var(--muted);
-      font-size: 13px;
-      font-weight: 650;
+      text-transform: uppercase;
+      letter-spacing: .04em;
     }
-    input[type="url"], input[type="password"], input[type="text"] {
+    input[type="url"],
+    input[type="password"],
+    input[type="text"] {
       width: 100%;
-      min-height: 42px;
+      min-height: 40px;
       border: 1px solid var(--line);
       border-radius: 6px;
-      padding: 10px 11px;
+      padding: 9px 11px;
       font: inherit;
+      font-size: 13px;
       color: var(--ink);
       background: #fff;
+      transition: border-color .15s;
     }
-    .row {
+    input:focus {
+      outline: none;
+      border-color: var(--accent);
+      box-shadow: 0 0 0 3px var(--accent-light);
+    }
+    .checkbox-row {
       display: flex;
       align-items: center;
-      gap: 10px;
-      min-height: 32px;
+      gap: 8px;
+      font-size: 13px;
       color: var(--muted);
-      font-size: 14px;
+      font-weight: 400;
+      text-transform: none;
+      letter-spacing: 0;
     }
-    button {
+    .btn-primary {
       min-height: 42px;
       border: 0;
       border-radius: 6px;
       padding: 10px 14px;
       font: inherit;
+      font-size: 14px;
       font-weight: 760;
       color: #fff;
       background: var(--accent);
       cursor: pointer;
+      transition: background .15s;
     }
-    button:hover { background: var(--accent-dark); }
-    button:disabled { opacity: .62; cursor: wait; }
-    .result {
-      min-height: 420px;
-      padding: 0;
+    .btn-primary:hover  { background: var(--accent-dark); }
+    .btn-primary:disabled { opacity: .55; cursor: wait; }
+    /* ── Result panel ──────────────────────────────────────────────────── */
+    .result-panel {
+      background: var(--panel);
+      border: 1px solid var(--line);
+      border-radius: 10px;
       overflow: hidden;
+      min-height: 480px;
     }
     .toolbar {
-      min-height: 54px;
-      padding: 14px 16px;
+      padding: 14px 18px;
       display: flex;
       justify-content: space-between;
-      gap: 12px;
       align-items: center;
+      gap: 12px;
+      border-bottom: 1px solid var(--line);
+      background: var(--surface);
+    }
+    .toolbar-title { font-size: 15px; font-weight: 700; }
+    .status-badge {
+      font-size: 12px;
+      font-weight: 700;
+      padding: 4px 10px;
+      border-radius: 99px;
+      background: var(--line);
+      color: var(--muted);
+    }
+    .status-badge.ok     { background: var(--ok-light);     color: var(--ok);     }
+    .status-badge.error  { background: var(--danger-light);  color: var(--danger); }
+    .status-badge.running{ background: var(--accent-light);  color: var(--accent); }
+    /* ── Metrics strip ─────────────────────────────────────────────────── */
+    .metrics-strip {
+      display: grid;
+      grid-template-columns: repeat(5, 1fr);
       border-bottom: 1px solid var(--line);
     }
-    .status {
+    .metric-cell {
+      padding: 12px 14px;
+      border-right: 1px solid var(--line);
+    }
+    .metric-cell:last-child { border-right: 0; }
+    .metric-cell .label {
+      font-size: 10px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .06em;
       color: var(--muted);
-      font-size: 14px;
+    }
+    .metric-cell .value {
+      font-size: 15px;
+      font-weight: 700;
+      color: var(--ink);
+      margin-top: 2px;
       overflow-wrap: anywhere;
     }
-    .content {
-      padding: 16px;
-      display: grid;
-      gap: 16px;
+    /* ── Report sections ───────────────────────────────────────────────── */
+    .report-body { padding: 18px; display: grid; gap: 16px; }
+    .idle-hint {
+      padding: 40px 20px;
+      text-align: center;
+      color: var(--muted);
     }
-    .grid {
-      display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+    .idle-hint .icon { font-size: 36px; margin-bottom: 10px; }
+    /* Section cards */
+    .section-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .section-header {
+      display: flex;
+      align-items: center;
       gap: 10px;
+      padding: 12px 14px;
+      background: var(--surface);
+      border-bottom: 1px solid var(--line);
+      cursor: pointer;
+      user-select: none;
     }
-    .metric {
+    .section-header:hover { background: #eff1f4; }
+    .section-icon {
+      width: 26px;
+      height: 26px;
+      border-radius: 6px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 14px;
+      flex-shrink: 0;
+    }
+    .icon-rca     { background: var(--blue-light);   color: var(--blue);   }
+    .icon-fix     { background: var(--ok-light);      color: var(--ok);     }
+    .icon-web     { background: var(--purple-light);  color: var(--purple); }
+    .icon-qref    { background: var(--accent-light);  color: var(--accent); }
+    .icon-timing    { background: var(--warn-light);    color: var(--warn);   }
+    .icon-validate  { background: var(--purple-light);  color: var(--purple); }
+    .toggle-disabled { opacity: .45; cursor: not-allowed; }
+    .section-title { font-weight: 700; font-size: 13px; flex: 1; }
+    .section-chevron { color: var(--muted); font-size: 11px; transition: transform .2s; }
+    .section-card.collapsed .section-chevron { transform: rotate(-90deg); }
+    .section-body { padding: 14px; }
+    .section-card.collapsed .section-body { display: none; }
+    /* ── RCA report grid ───────────────────────────────────────────────── */
+    .rca-grid { display: grid; gap: 10px; }
+    .field-row { display: grid; grid-template-columns: 140px 1fr; gap: 8px; align-items: baseline; font-size: 13px; }
+    .field-label { color: var(--muted); font-weight: 700; font-size: 12px; }
+    .field-value { color: var(--ink); overflow-wrap: anywhere; }
+    .badge {
+      display: inline-block;
+      padding: 2px 9px;
+      border-radius: 99px;
+      font-size: 11px;
+      font-weight: 700;
+    }
+    .badge-red    { background: var(--danger-light); color: var(--danger); }
+    .badge-yellow { background: var(--warn-light);   color: var(--warn);   }
+    .badge-green  { background: var(--ok-light);     color: var(--ok);     }
+    .badge-blue   { background: var(--blue-light);   color: var(--blue);   }
+    .badge-purple { background: var(--purple-light);  color: var(--purple); }
+    .badge-gray   { background: var(--surface);       color: var(--muted);  border: 1px solid var(--line); }
+    .evidence-list { list-style: none; display: grid; gap: 6px; margin-top: 4px; }
+    .evidence-list li {
+      padding: 8px 10px;
+      background: #101820;
+      color: #c5d3de;
+      border-radius: 6px;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 12px;
+      line-height: 1.5;
+      overflow-wrap: anywhere;
+    }
+    .divider { border: 0; border-top: 1px solid var(--line); }
+    /* ── Fix cards ─────────────────────────────────────────────────────── */
+    .fix-list { display: grid; gap: 12px; }
+    .fix-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .fix-card-header {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 11px 13px;
+      background: var(--surface);
+    }
+    .fix-rank {
+      width: 24px;
+      height: 24px;
+      border-radius: 99px;
+      background: var(--accent);
+      color: #fff;
+      font-size: 12px;
+      font-weight: 700;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      flex-shrink: 0;
+    }
+    .fix-desc { font-size: 13px; font-weight: 600; line-height: 1.4; flex: 1; }
+    .fix-badges { display: flex; gap: 5px; flex-wrap: wrap; margin-top: 6px; }
+    .fix-meta { padding: 10px 13px; display: grid; gap: 6px; }
+    .fix-snippet {
+      padding: 10px 13px;
+      background: #101820;
+      color: #c5d3de;
+      font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+      font-size: 12px;
+      overflow: auto;
+      white-space: pre;
+    }
+    .fix-command {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      padding: 8px 13px;
+      background: var(--ok-light);
+      font-family: "SFMono-Regular", Consolas, monospace;
+      font-size: 12px;
+      color: var(--ok);
+    }
+    .fix-warnings { padding: 8px 13px; background: var(--warn-light); }
+    .fix-warnings ul { padding-left: 18px; color: var(--warn); font-size: 12px; }
+    .feedback-row { padding: 8px 13px; display: flex; align-items: center; gap: 8px; }
+    .btn-feedback {
+      border: 1px solid var(--line);
+      border-radius: 4px;
+      padding: 4px 10px;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+      background: var(--panel);
+      color: var(--muted);
+      transition: all .15s;
+    }
+    .btn-feedback:hover { border-color: var(--accent); color: var(--accent); }
+    .btn-feedback.applied   { background: var(--ok-light);     border-color: var(--ok);     color: var(--ok);     }
+    .btn-feedback.dismissed { background: var(--danger-light);  border-color: var(--danger);  color: var(--danger); }
+    /* ── Validate Fix feedback form ────────────────────────────────────── */
+    .btn-validate {
+      border: 1px solid var(--purple);
+      border-radius: 4px;
+      padding: 4px 10px;
+      font: inherit;
+      font-size: 12px;
+      cursor: pointer;
+      background: var(--purple-light);
+      color: var(--purple);
+      transition: all .15s;
+      margin-left: auto;
+    }
+    .btn-validate:hover { background: var(--purple); color: #fff; }
+    .btn-validate.validated { background: var(--ok-light); border-color: var(--ok); color: var(--ok); cursor: default; }
+    .feedback-form-container {
+      border-top: 1px solid var(--line);
+      padding: 12px 13px;
+      background: var(--surface);
+      display: none;
+    }
+    .feedback-form-container.open { display: block; }
+    .feedback-form-title { font-size: 12px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; margin-bottom: 10px; }
+    .tristate-group { display: flex; gap: 0; border: 1px solid var(--line); border-radius: 5px; overflow: hidden; }
+    .tristate-group label {
+      flex: 1;
+      text-align: center;
+      padding: 5px 4px;
+      font-size: 12px;
+      font-weight: 600;
+      cursor: pointer;
+      background: var(--panel);
+      color: var(--muted);
+      border-right: 1px solid var(--line);
+      transition: background .12s, color .12s;
+      text-transform: none;
+      letter-spacing: 0;
+    }
+    .tristate-group label:last-child { border-right: 0; }
+    .tristate-group input[type="radio"] { display: none; }
+    .tristate-group input[type="radio"]:checked + label { background: var(--accent); color: #fff; }
+    .star-rating { display: flex; gap: 4px; }
+    .star-rating label { cursor: pointer; font-size: 20px; color: var(--line); transition: color .1s; }
+    .star-rating input[type="radio"] { display: none; }
+    .star-rating input[type="radio"]:checked ~ label,
+    .star-rating label:hover,
+    .star-rating label:hover ~ label { color: #f59e0b; }
+    .fb-field-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 10px 16px; margin-bottom: 10px; }
+    .fb-field { display: grid; gap: 4px; }
+    .fb-field .fb-label { font-size: 11px; font-weight: 700; color: var(--muted); text-transform: uppercase; letter-spacing: .04em; }
+    .fb-conf-display { font-size: 13px; font-weight: 700; color: var(--ink); padding: 5px 0; }
+    .fb-comment { width: 100%; min-height: 56px; border: 1px solid var(--line); border-radius: 5px; padding: 7px 9px; font: inherit; font-size: 12px; resize: vertical; margin-bottom: 10px; }
+    .fb-comment:focus { outline: none; border-color: var(--accent); box-shadow: 0 0 0 2px var(--accent-light); }
+    .btn-fb-submit {
+      padding: 6px 18px;
+      border: 0;
+      border-radius: 5px;
+      background: var(--accent);
+      color: #fff;
+      font: inherit;
+      font-size: 13px;
+      font-weight: 700;
+      cursor: pointer;
+      transition: background .15s;
+    }
+    .btn-fb-submit:hover { background: var(--accent-dark); }
+    .btn-fb-submit:disabled { opacity: .5; cursor: wait; }
+    .fb-inline-error { font-size: 12px; color: var(--danger); margin-top: 6px; }
+    /* ── Web search results ────────────────────────────────────────────── */
+    .ref-list { display: grid; gap: 10px; }
+    .ref-card {
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      padding: 12px 14px;
+      display: grid;
+      gap: 5px;
+    }
+    .ref-card-top { display: flex; align-items: flex-start; justify-content: space-between; gap: 10px; }
+    .ref-title { font-size: 13px; font-weight: 600; }
+    .ref-snippet { font-size: 12px; color: var(--muted); line-height: 1.5; }
+    .ref-url { font-size: 11px; color: var(--muted); overflow-wrap: anywhere; }
+    .ref-score { font-size: 11px; color: var(--muted); white-space: nowrap; flex-shrink: 0; }
+    .no-refs { color: var(--muted); font-size: 13px; font-style: italic; padding: 4px 0; }
+    /* quick-reference source type icons */
+    .qref-source-icon {
+      display: inline-block;
+      width: 16px;
+      height: 16px;
+      border-radius: 3px;
+      font-size: 10px;
+      line-height: 16px;
+      text-align: center;
+      flex-shrink: 0;
+      font-weight: 700;
+      margin-right: 4px;
+      vertical-align: middle;
+    }
+    .qref-doc   { background: var(--blue-light);   color: var(--blue);   }
+    .qref-issue { background: var(--ok-light);      color: var(--ok);     }
+    .qref-pr    { background: var(--purple-light);  color: var(--purple); }
+    .qref-other { background: var(--surface);       color: var(--muted);  }
+    .deep-search-divider {
+      border: 0;
+      border-top: 1px dashed var(--line);
+      margin: 12px 0 8px;
+    }
+    .deep-search-label {
+      font-size: 11px;
+      font-weight: 700;
+      text-transform: uppercase;
+      letter-spacing: .05em;
+      color: var(--muted);
+      margin-bottom: 8px;
+    }
+    /* ── Timing section ────────────────────────────────────────────────── */
+    .timing-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 10px; }
+    .timing-cell {
       border: 1px solid var(--line);
       border-radius: 8px;
       padding: 12px;
-      min-height: 74px;
-      background: #fbfcfe;
+      background: var(--surface);
+      text-align: center;
     }
-    .metric span {
-      display: block;
-      color: var(--muted);
-      font-size: 12px;
-      font-weight: 700;
-      text-transform: uppercase;
-    }
-    .metric strong {
-      display: block;
-      margin-top: 6px;
-      font-size: 16px;
-      overflow-wrap: anywhere;
-    }
-    pre {
-      margin: 0;
-      padding: 14px;
-      border: 1px solid var(--line);
-      border-radius: 8px;
-      background: #101820;
-      color: #e8f0f7;
-      overflow: auto;
-      max-height: 520px;
-      white-space: pre-wrap;
-      overflow-wrap: anywhere;
-      font-size: 13px;
-      line-height: 1.45;
-    }
-    .error { color: var(--danger); }
-    .ok { color: var(--ok); }
-    @media (max-width: 860px) {
-      header { padding: 20px 16px 14px; }
+    .timing-cell .t-label { font-size: 11px; color: var(--muted); font-weight: 700; text-transform: uppercase; }
+    .timing-cell .t-value { font-size: 22px; font-weight: 700; color: var(--ink); margin-top: 3px; }
+    .timing-cell .t-unit  { font-size: 11px; color: var(--muted); }
+    /* ── Remediation steps list ────────────────────────────────────────── */
+    .steps-list { padding-left: 20px; display: grid; gap: 5px; }
+    .steps-list li { font-size: 13px; }
+    /* ── Responsive ────────────────────────────────────────────────────── */
+    @media (max-width: 900px) {
+      header { padding: 16px 16px 12px; }
       main { grid-template-columns: 1fr; width: calc(100vw - 24px); margin-top: 16px; }
-      .grid { grid-template-columns: 1fr; }
+      .form-card { position: static; }
+      .metrics-strip { grid-template-columns: repeat(3, 1fr); }
+      .timing-grid { grid-template-columns: 1fr 1fr; }
+    }
+    @media (max-width: 560px) {
+      .metrics-strip { grid-template-columns: 1fr 1fr; }
+      .field-row { grid-template-columns: 1fr; }
     }
   </style>
 </head>
 <body>
-  <header>
+
+<header>
+  <span style="display:flex;align-items:baseline;gap:12px;flex:1">
     <h1>Smart CI Remediation</h1>
-  </header>
-  <main>
-    <form id="diagnosis-form">
-      <label>
-        GitHub Actions Run URL
-        <input name="run_url" type="url" required placeholder="https://github.com/OWNER/REPO/actions/runs/123456789">
-      </label>
-      <label>
-        GitHub Token
-        <input name="github_token" type="password" placeholder="Uses GITHUB_TOKEN when blank">
-      </label>
-      <label>
-        Claude Model ID
-        <input name="model_id" type="text" value="{{ model_id }}">
-      </label>
-      <label class="row">
-        <input name="use_model" type="checkbox" checked>
-        Use Claude Sonnet for RCA
-      </label>
-      <button id="submit" type="submit">Diagnose Failure</button>
-    </form>
-    <section class="result">
-      <div class="toolbar">
-        <strong>RCA Output</strong>
-        <span id="status" class="status">Idle</span>
+    <span class="tagline">GitHub Actions failure analysis &amp; fix recommendations</span>
+  </span>
+  <nav style="display:flex;gap:6px;align-items:center">
+    <a href="/" style="padding:5px 11px;border-radius:6px;font-size:13px;font-weight:600;background:var(--accent-light);color:var(--accent-dark);border:1px solid var(--line);text-decoration:none">Home</a>
+    <a href="/stats" style="padding:5px 11px;border-radius:6px;font-size:13px;font-weight:600;color:var(--muted);border:1px solid transparent;text-decoration:none" onmouseover="this.style.background='var(--surface)'" onmouseout="this.style.background='transparent'">Statistics</a>
+    <a href="/evaluation" style="padding:5px 11px;border-radius:6px;font-size:13px;font-weight:600;color:var(--muted);border:1px solid transparent;text-decoration:none" onmouseover="this.style.background='var(--surface)'" onmouseout="this.style.background='transparent'">Evaluation</a>
+  </nav>
+</header>
+
+<main>
+  <!-- ── Input form ──────────────────────────────────────────────────── -->
+  <form class="form-card" id="diagnosis-form" autocomplete="off">
+    <h2>Diagnose a failing run</h2>
+
+    <label>
+      GitHub Actions Run URL
+      <input name="run_url" type="url" required
+             placeholder="https://github.com/OWNER/REPO/actions/runs/…">
+    </label>
+
+    <label>
+      GitHub Username
+      <input name="github_username" type="text"
+             placeholder="your-github-username">
+    </label>
+
+    <label>
+      GitHub Access Token
+      <input name="github_token" type="password"
+             placeholder="ghp_… (falls back to GITHUB_TOKEN env)">
+    </label>
+
+    <label class="checkbox-row">
+      <input name="use_model" type="checkbox" checked>
+      Use LLM for RCA
+    </label>
+
+    <button class="btn-primary" id="submit-btn" type="submit">
+      Diagnose Failure
+    </button>
+
+    <div style="border-top:1px solid var(--line);padding-top:12px;margin-top:4px">
+      <div style="font-size:11px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:6px">Knowledge Base</div>
+      <button type="button" id="kb-update-btn"
+        style="width:100%;padding:8px 12px;border-radius:6px;border:1px solid var(--line);background:var(--surface);font:inherit;font-size:13px;font-weight:600;cursor:pointer;color:var(--ink)"
+        onmouseover="this.style.background='#eff1f4'" onmouseout="this.style.background='var(--surface)'">
+        ⚙ Run KB Batch Update
+      </button>
+      <div id="kb-update-status" style="font-size:11px;color:var(--muted);margin-top:5px;min-height:16px"></div>
+    </div>
+  </form>
+
+  <!-- ── Result panel ────────────────────────────────────────────────── -->
+  <section class="result-panel" id="result-panel">
+    <div class="toolbar">
+      <span class="toolbar-title">RCA Report</span>
+      <span class="status-badge" id="status-badge">Idle</span>
+    </div>
+
+    <!-- Metrics strip -->
+    <div class="metrics-strip" id="metrics-strip">
+      <div class="metric-cell"><div class="label">Repository</div><div class="value" id="m-repo">—</div></div>
+      <div class="metric-cell"><div class="label">Run ID</div><div class="value" id="m-run">—</div></div>
+      <div class="metric-cell"><div class="label">Signals</div><div class="value" id="m-signals">—</div></div>
+      <div class="metric-cell"><div class="label">Failure blocks</div><div class="value" id="m-blocks">—</div></div>
+      <div class="metric-cell"><div class="label">KB hits</div><div class="value" id="m-kb">—</div></div>
+      <div class="metric-cell"><div class="label">Generated in</div><div class="value" id="m-time">—</div></div>
+    </div>
+
+    <!-- Idle hint (hidden once results arrive) -->
+    <div class="report-body" id="idle-state">
+      <div class="idle-hint">
+        <div class="icon">🔍</div>
+        <p>Enter a failing GitHub Actions run URL and click <strong>Diagnose Failure</strong> to generate a root cause analysis.</p>
       </div>
-      <div id="content" class="content">
-        <div class="grid">
-          <div class="metric"><span>Run</span><strong>-</strong></div>
-          <div class="metric"><span>Signals</span><strong>-</strong></div>
-          <div class="metric"><span>Blocks</span><strong>-</strong></div>
+    </div>
+
+    <!-- Report body (hidden until results arrive) -->
+    <div class="report-body" id="report-body" style="display:none">
+
+      <!-- ① RCA section -->
+      <div class="section-card" id="sec-rca">
+        <div class="section-header" onclick="toggleSection('sec-rca')">
+          <div class="section-icon icon-rca">🧠</div>
+          <span class="section-title">Root Cause Analysis</span>
+          <span class="section-chevron">▼</span>
         </div>
-        <pre id="output">{}</pre>
+        <div class="section-body">
+          <div class="rca-grid" id="rca-content"></div>
+          <!-- ── Automated Validation sub-panel (Track B) ── -->
+          <div id="validate-subpanel" style="display:none;border-top:1px solid var(--line);margin-top:14px;padding-top:14px;">
+            <div style="font-size:12px;font-weight:700;color:var(--muted);text-transform:uppercase;letter-spacing:.04em;margin-bottom:10px">
+              <span class="section-icon icon-validate" style="display:inline-flex;width:22px;height:22px;font-size:12px;vertical-align:middle;margin-right:6px;border-radius:4px;">▶</span>
+              Automated CI Validation
+            </div>
+            <div id="validate-live-status" style="font-size:12px;margin-bottom:10px;padding:6px 10px;border-radius:5px;background:var(--surface);border:1px solid var(--line);color:var(--muted)">
+              Checking live validation status…
+            </div>
+            <div class="fb-field-grid" style="margin-bottom:10px">
+              <div class="fb-field">
+                <div class="fb-label">Fork Repository</div>
+                <input type="text" id="val-fork-repo" class="val-input"
+                       placeholder="owner/your-fork-name"
+                       style="width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:5px;font:inherit;font-size:13px;">
+              </div>
+              <div class="fb-field">
+                <div class="fb-label">Branch</div>
+                <input type="text" id="val-branch" class="val-input" value="main"
+                       style="width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:5px;font:inherit;font-size:13px;">
+              </div>
+              <div class="fb-field">
+                <div class="fb-label">GitHub Username</div>
+                <input type="text" id="val-username" class="val-input"
+                       placeholder="your-github-username"
+                       style="width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:5px;font:inherit;font-size:13px;">
+              </div>
+              <div class="fb-field">
+                <div class="fb-label">GitHub Token</div>
+                <input type="password" id="val-token" class="val-input"
+                       placeholder="ghp_… (pre-filled from form)"
+                       style="width:100%;padding:7px 9px;border:1px solid var(--line);border-radius:5px;font:inherit;font-size:13px;">
+              </div>
+            </div>
+            <div class="fb-field" style="margin-bottom:10px">
+              <div class="fb-label">Fix Ranks to Validate</div>
+              <div id="val-rank-checks" style="display:flex;gap:12px;flex-wrap:wrap;margin-top:4px;font-size:13px;">
+                <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-weight:400;text-transform:none;letter-spacing:0"><input type="checkbox" id="val-rank-all" checked onchange="toggleAllRanks(this)"> All</label>
+                <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-weight:400;text-transform:none;letter-spacing:0"><input type="checkbox" class="val-rank-cb" value="1"> Fix 1</label>
+                <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-weight:400;text-transform:none;letter-spacing:0"><input type="checkbox" class="val-rank-cb" value="2"> Fix 2</label>
+                <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-weight:400;text-transform:none;letter-spacing:0"><input type="checkbox" class="val-rank-cb" value="3"> Fix 3</label>
+                <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-weight:400;text-transform:none;letter-spacing:0"><input type="checkbox" class="val-rank-cb" value="4"> Fix 4</label>
+                <label style="display:flex;align-items:center;gap:4px;cursor:pointer;font-weight:400;text-transform:none;letter-spacing:0"><input type="checkbox" class="val-rank-cb" value="5"> Fix 5</label>
+              </div>
+            </div>
+            <div class="fb-field" style="margin-bottom:12px">
+              <div class="fb-label">Enable Live CI Validation</div>
+              <label style="display:flex;align-items:center;gap:8px;margin-top:4px;font-weight:400;text-transform:none;letter-spacing:0;font-size:13px;cursor:pointer">
+                <input type="checkbox" id="val-live-mode">
+                <span id="val-live-label" style="color:var(--muted)">Loading…</span>
+              </label>
+            </div>
+            <button id="btn-run-validation" class="btn-fb-submit" style="width:100%;display:flex;align-items:center;justify-content:center;gap:6px" onclick="submitValidation()">
+              ▶ Run Automated Validation
+            </button>
+            <div id="val-error" style="font-size:12px;color:var(--danger);margin-top:6px;"></div>
+          </div>
+        </div>
       </div>
-    </section>
-  </main>
-  <script>
-    const form = document.getElementById('diagnosis-form');
-    const submit = document.getElementById('submit');
-    const statusEl = document.getElementById('status');
-    const output = document.getElementById('output');
-    const metrics = document.querySelectorAll('.metric strong');
 
-    function formatList(items) {
-      if (!Array.isArray(items) || items.length === 0) {
-        return '-';
-      }
-      return items.map((item) => `- ${item}`).join('\n');
+      <!-- ② Fix recommendations section -->
+      <div class="section-card" id="sec-fixes">
+        <div class="section-header" onclick="toggleSection('sec-fixes')">
+          <div class="section-icon icon-fix">🔧</div>
+          <span class="section-title">Fix Recommendations</span>
+          <span class="section-chevron">▼</span>
+        </div>
+        <div class="section-body">
+          <div class="fix-list" id="fixes-content"></div>
+        </div>
+      </div>
+
+      <!-- ③ Quick references section (light search — always shown) -->
+      <div class="section-card" id="sec-qref">
+        <div class="section-header" onclick="toggleSection('sec-qref')">
+          <div class="section-icon icon-qref">🔗</div>
+          <span class="section-title">Quick References</span>
+          <span class="section-chevron">▼</span>
+        </div>
+        <div class="section-body">
+          <div id="qref-content"></div>
+        </div>
+      </div>
+
+      <!-- ④ Web search references section (deep search — conditional) -->
+      <!-- Deep Web Search section — hidden (deep search disabled, DEEP_SEARCH_ENABLED=False).
+           Kept in DOM so the web_search API field is still processed by renderWebSearch().
+           Remove the display:none to re-enable when deep search is turned back on. -->
+      <div class="section-card collapsed" id="sec-web" style="display:none">
+        <div class="section-header" onclick="toggleSection('sec-web')">
+          <div class="section-icon icon-web">🌐</div>
+          <span class="section-title">Deep Web Search</span>
+          <span class="section-chevron">▼</span>
+        </div>
+        <div class="section-body">
+          <div class="ref-list" id="web-content"></div>
+        </div>
+      </div>
+
+      <!-- ⑤ Validation Results section (Track B — hidden until first result) -->
+      <div class="section-card" id="sec-validate" style="display:none">
+        <div class="section-header" onclick="toggleSection('sec-validate')">
+          <div class="section-icon icon-validate">▶</div>
+          <span class="section-title">Automated Validation Results</span>
+          <span class="section-chevron">▼</span>
+        </div>
+        <div class="section-body" id="validate-results-content">
+          <p class="no-refs">No validation results yet.</p>
+        </div>
+      </div>
+
+      <!-- ⑥ Timing section -->
+      <div class="section-card" id="sec-timing">
+        <div class="section-header" onclick="toggleSection('sec-timing')">
+          <div class="section-icon icon-timing">⏱</div>
+          <span class="section-title">Generation Timing</span>
+          <span class="section-chevron">▼</span>
+        </div>
+        <div class="section-body" id="timing-content"></div>
+      </div>
+
+    </div><!-- /report-body -->
+  </section>
+</main>
+
+<script>
+  // ── Utilities ──────────────────────────────────────────────────────────────
+
+  function esc(s) {
+    return String(s ?? '')
+      .replace(/&/g, '&amp;')
+      .replace(/</g, '&lt;')
+      .replace(/>/g, '&gt;')
+      .replace(/"/g, '&quot;');
+  }
+
+  function toggleSection(id)
+  {
+    document.getElementById(id).classList.toggle('collapsed');
+    saveRcaSessionState();
+  }
+  function severityBadge(s) {
+    const map = { critical: 'badge-red', high: 'badge-red', medium: 'badge-yellow',
+                  low: 'badge-green', unknown: 'badge-gray' };
+    const cls = map[(s || '').toLowerCase()] || 'badge-blue';
+    return `<span class="badge ${cls}">${esc(s || '—')}</span>`;
+  }
+
+  function confidenceBadge(c) {
+    const low = ['low', 'unknown', ''];
+    const med = ['medium'];
+    const cls = low.includes((c || '').toLowerCase()) ? 'badge-yellow'
+              : med.includes((c || '').toLowerCase())  ? 'badge-blue'
+              : 'badge-green';
+    return `<span class="badge ${cls}">${esc(c || '—')}</span>`;
+  }
+
+  function sourceBadge(s) {
+    const map = { model: 'badge-blue', knowledge_base: 'badge-green',
+                  heuristic_fallback: 'badge-yellow' };
+    return `<span class="badge ${map[s] || 'badge-gray'}">${esc(s || '—')}</span>`;
+  }
+
+  function typeBadge(t) {
+    return t ? `<span class="badge badge-purple">${esc(t)}</span>` : '—';
+  }
+
+  function refTypeBadge(t) {
+    const map = { documentation: 'badge-blue', github_issues_repo: 'badge-green',
+                  github_issues_general: 'badge-green', github_prs: 'badge-purple',
+                  github_issue: 'badge-green', github_pr: 'badge-purple',
+                  github_code: 'badge-gray' };
+    return `<span class="badge ${map[t] || 'badge-gray'}">${esc(t || 'source')}</span>`;
+  }
+
+  /** Small coloured icon prefix for quick-reference source types */
+  function qrefSourceIcon(t) {
+    if (t === 'documentation')                                     return '<span class="qref-source-icon qref-doc"  title="Official Docs">D</span>';
+    if (t === 'github_issue' || t === 'github_issues_repo' || t === 'github_issues_general') return '<span class="qref-source-icon qref-issue" title="GitHub Issue">#</span>';
+    if (t === 'github_pr'    || t === 'github_prs')                return '<span class="qref-source-icon qref-pr"   title="GitHub PR">↑</span>';
+    return '<span class="qref-source-icon qref-other" title="Source">·</span>';
+  }
+
+  function fieldRow(label, valueHtml) {
+    return `<div class="field-row">
+      <span class="field-label">${esc(label)}</span>
+      <span class="field-value">${valueHtml}</span>
+    </div>`;
+  }
+
+  // ── Renderers ──────────────────────────────────────────────────────────────
+
+  function renderRca(rca) {
+    if (!rca || typeof rca !== 'object') return '<p class="no-refs">No RCA data.</p>';
+
+    const loc = rca.failure_location || {};
+    const locParts = [
+      loc.job        ? `<strong>Job:</strong> ${esc(loc.job)}`            : null,
+      loc.log_file   ? `<strong>Log file:</strong> ${esc(loc.log_file)}`  : null,
+      loc.line       ? `<strong>Line:</strong> ${esc(loc.line)}`          : null,
+      loc.line_range ? `<strong>Range:</strong> ${esc(loc.line_range)}`   : null,
+    ].filter(Boolean).join(' &nbsp;·&nbsp; ');
+
+    const evidence = Array.isArray(rca.evidence) ? rca.evidence : [];
+    const remSteps = Array.isArray(rca.remediation_steps) ? rca.remediation_steps : [];
+    const verifCmds = Array.isArray(rca.verification_commands) ? rca.verification_commands : [];
+
+    const diagNote = rca.diagnosis_note
+      ? `<div style="padding:8px 10px;background:var(--warn-light);border-radius:6px;font-size:12px;color:var(--warn);margin-top:4px;">${esc(rca.diagnosis_note)}</div>`
+      : '';
+
+    // Explainable confidence badge from confidence_report if available
+    const crRca = rca.confidence_report;
+    const confDisplay = crRca
+      ? `${confidenceBadge(crRca.label)} <span style="font-size:11px;color:var(--muted)">${Math.round(crRca.score*100)}% — ${esc(crRca.explanation)}</span>`
+      : confidenceBadge(rca.confidence);
+
+    return `
+      ${fieldRow('Summary',         `<span style="white-space:pre-wrap">${esc(rca.rca_summary || '—')}</span>`)}
+      <hr class="divider">
+      ${fieldRow('Failure stage',   esc(rca.failure_stage   || '—'))}
+      ${fieldRow('Failure type',    typeBadge(rca.failure_type || rca.error_type))}
+      ${fieldRow('Error code',      rca.error_code ? `<code>${esc(rca.error_code)}</code>` : '—')}
+      ${fieldRow('Severity',        severityBadge(rca.severity))}
+      ${fieldRow('Confidence',      confDisplay)}
+      ${fieldRow('Diagnosis mode',  sourceBadge(rca.source || rca.diagnosis_mode))}
+      ${fieldRow('Error signature', rca.error_signature ? `<code style="font-size:11px">${esc(rca.error_signature)}</code>` : '—')}
+      ${locParts ? `<hr class="divider">${fieldRow('Location', locParts)}` : ''}
+      ${diagNote}
+      ${evidence.length ? `
+        <hr class="divider">
+        <div class="field-label" style="margin-bottom:4px">Evidence</div>
+        <ul class="evidence-list">
+          ${evidence.map(ev => {
+            const msg = typeof ev === 'string' ? ev
+                      : [ev.line ? `L${ev.line}:` : '', ev.message || ''].filter(Boolean).join(' ');
+            return `<li>${esc(msg)}</li>`;
+          }).join('')}
+        </ul>
+      ` : ''}
+      ${remSteps.length ? `
+        <hr class="divider">
+        <div class="field-label" style="margin-bottom:6px">Remediation steps</div>
+        <ol class="steps-list">
+          ${remSteps.map(s => `<li>${esc(s)}</li>`).join('')}
+        </ol>
+      ` : ''}
+      ${verifCmds.length ? `
+        <hr class="divider">
+        <div class="field-label" style="margin-bottom:4px">Verification commands</div>
+        <ul class="evidence-list">
+          ${verifCmds.map(c => `<li>${esc(c)}</li>`).join('')}
+        </ul>
+      ` : ''}
+    `;
+  }
+
+  function renderFixes(fixesData) {
+    const fixes = Array.isArray(fixesData?.fixes) ? fixesData.fixes : [];
+    const summary = fixesData?.validation_summary || {};
+    const genErrors = fixesData?.generation_errors || {};
+
+    if (!fixes.length) {
+      return '<p class="no-refs">No fix recommendations generated.</p>';
     }
 
-    function formatEvidence(items) {
-      if (!Array.isArray(items) || items.length === 0) {
-        return '-';
+    const metaLine = [
+      summary.total_validated != null   ? `<strong>${summary.total_validated}</strong> validated`           : null,
+      summary.manual_review_count       ? `<span class="badge badge-yellow">${summary.manual_review_count} manual review</span>` : null,
+      summary.blocked_count             ? `<span class="badge badge-red">${summary.blocked_count} blocked</span>` : null,
+    ].filter(Boolean).join(' &nbsp;');
+
+    const errorNote = Object.entries(genErrors).map(([src, msg]) =>
+      `<span class="badge badge-gray">${esc(src)}: ${esc(msg)}</span>`
+    ).join(' ');
+
+    const effortBadge = e => {
+      const m = { low: 'badge-green', medium: 'badge-yellow', high: 'badge-red' };
+      return `<span class="badge ${m[e] || 'badge-gray'}">${esc(e || 'medium')} effort</span>`;
+    };
+
+    const fixTypeBadge = t => {
+      const m = { code_change: 'badge-blue', config_change: 'badge-purple',
+                  dependency_update: 'badge-green', command: 'badge-yellow', template: 'badge-gray' };
+      return `<span class="badge ${m[t] || 'badge-gray'}">${esc(t || 'fix')}</span>`;
+    };
+
+    const cards = fixes.map((fix, idx) => {
+      const rank    = fix.rank || (idx + 1);
+      const fixIdx  = idx;
+      const warnings = Array.isArray(fix.warnings) ? fix.warnings : [];
+      const sideEffects = Array.isArray(fix.side_effects) ? fix.side_effects : [];
+      // Confidence badge: prefer confidence_report if available, fall back to final_score %
+      const crFix   = fix.confidence_report;
+      const scoreText = crFix
+        ? `<span class="ref-score" title="${esc(crFix.explanation)}">${Math.round(crFix.score*100)}% confidence</span>`
+        : (fix.final_score != null ? `<span class="ref-score">score: ${Number(fix.final_score).toFixed(3)}</span>` : '');
+
+      const extraMeta = [
+        fix.file_path ? `<span class="badge badge-gray">📄 ${esc(fix.file_path)}</span>` : null,
+        fix.source    ? `<span class="badge badge-gray">src: ${esc(fix.source)}</span>` : null,
+        fix.requires_manual_review ? `<span class="badge badge-yellow">⚠ manual review</span>` : null,
+      ].filter(Boolean).join(' ');
+
+      return `
+        <div class="fix-card">
+          <div class="fix-card-header">
+            <div class="fix-rank">${rank}</div>
+            <div style="flex:1">
+              <div class="fix-desc">${esc(fix.description || 'No description')}</div>
+              <div class="fix-badges">
+                ${fixTypeBadge(fix.fix_type)}
+                ${effortBadge(fix.estimated_effort)}
+                ${fix.success_rate != null ? `<span class="badge badge-blue">✓ ${Math.round(fix.success_rate * 100)}% historical success</span>` : ''}
+                ${extraMeta}
+                ${scoreText}
+              </div>
+            </div>
+          </div>
+          ${fix.code_snippet ? `<pre class="fix-snippet">${esc(fix.code_snippet)}</pre>` : ''}
+          ${fix.command ? `<div class="fix-command">$ ${esc(fix.command)}</div>` : ''}
+          ${(warnings.length || sideEffects.length) ? `
+            <div class="fix-warnings">
+              ${warnings.length ? `<ul>${warnings.map(w => `<li>${esc(w)}</li>`).join('')}</ul>` : ''}
+              ${sideEffects.length ? `<ul style="color:var(--muted)">${sideEffects.map(e => `<li>Side effect: ${esc(e)}</li>`).join('')}</ul>` : ''}
+            </div>` : ''}
+          <div class="feedback-row">
+            <span style="font-size:12px;color:var(--muted)">Was this fix helpful?</span>
+            <button class="btn-feedback" onclick="sendFeedback(this,'${esc(fix.fix_type)}','${esc(fix.error_type || '')}',true)">✓ Applied &amp; worked</button>
+            <button class="btn-feedback" onclick="sendFeedback(this,'${esc(fix.fix_type)}','${esc(fix.error_type || '')}',false)">✗ Did not work</button>
+            <button class="btn-validate" id="btn-validate-${fixIdx}" onclick="toggleValidateForm(${fixIdx})">✎ Validate Fix</button>
+          </div>
+          <div class="feedback-form-container" id="fb-form-${fixIdx}">
+            <div class="feedback-form-title">Validate Fix #${rank} — Human Feedback</div>
+            <div class="fb-field-grid">
+              <div class="fb-field">
+                <div class="fb-label">Root Cause Correct</div>
+                <div class="tristate-group">
+                  <input type="radio" name="rcc-${fixIdx}" id="rcc-y-${fixIdx}" value="yes"><label for="rcc-y-${fixIdx}">Yes</label>
+                  <input type="radio" name="rcc-${fixIdx}" id="rcc-p-${fixIdx}" value="partially"><label for="rcc-p-${fixIdx}">Partially</label>
+                  <input type="radio" name="rcc-${fixIdx}" id="rcc-n-${fixIdx}" value="no"><label for="rcc-n-${fixIdx}">No</label>
+                </div>
+              </div>
+              <div class="fb-field">
+                <div class="fb-label">Fix Correct</div>
+                <div class="tristate-group">
+                  <input type="radio" name="fc-${fixIdx}" id="fc-y-${fixIdx}" value="yes"><label for="fc-y-${fixIdx}">Yes</label>
+                  <input type="radio" name="fc-${fixIdx}" id="fc-p-${fixIdx}" value="partially"><label for="fc-p-${fixIdx}">Partially</label>
+                  <input type="radio" name="fc-${fixIdx}" id="fc-n-${fixIdx}" value="no"><label for="fc-n-${fixIdx}">No</label>
+                </div>
+              </div>
+              <div class="fb-field">
+                <div class="fb-label">Fix Resolved Issue</div>
+                <div class="tristate-group">
+                  <input type="radio" name="ri-${fixIdx}" id="ri-y-${fixIdx}" value="yes"><label for="ri-y-${fixIdx}">Yes</label>
+                  <input type="radio" name="ri-${fixIdx}" id="ri-p-${fixIdx}" value="partially"><label for="ri-p-${fixIdx}">Partially</label>
+                  <input type="radio" name="ri-${fixIdx}" id="ri-n-${fixIdx}" value="no"><label for="ri-n-${fixIdx}">No</label>
+                </div>
+              </div>
+              <div class="fb-field">
+                <div class="fb-label">Confidence</div>
+                <div class="fb-conf-display">${fix.confidence_report?.score != null ? Math.round(fix.confidence_report.score * 100) + '%' : (fix.final_score != null ? (Number(fix.final_score)*100).toFixed(0) + '%' : '—')}</div>
+              </div>
+            </div>
+            <div class="fb-field" style="margin-bottom:10px">
+              <div class="fb-label">Rating</div>
+              <div class="star-rating" id="stars-${fixIdx}">
+                <input type="radio" name="rating-${fixIdx}" id="r5-${fixIdx}" value="5"><label for="r5-${fixIdx}">★</label>
+                <input type="radio" name="rating-${fixIdx}" id="r4-${fixIdx}" value="4"><label for="r4-${fixIdx}">★</label>
+                <input type="radio" name="rating-${fixIdx}" id="r3-${fixIdx}" value="3"><label for="r3-${fixIdx}">★</label>
+                <input type="radio" name="rating-${fixIdx}" id="r2-${fixIdx}" value="2"><label for="r2-${fixIdx}">★</label>
+                <input type="radio" name="rating-${fixIdx}" id="r1-${fixIdx}" value="1"><label for="r1-${fixIdx}">★</label>
+              </div>
+            </div>
+            <textarea class="fb-comment" id="fb-comment-${fixIdx}" placeholder="Optional comment…"></textarea>
+            <div style="display:flex;align-items:center;gap:10px">
+              <button class="btn-fb-submit" id="btn-fb-submit-${fixIdx}" onclick="submitValidateFeedback(${fixIdx})">Submit Feedback</button>
+              <button style="background:none;border:none;font:inherit;font-size:12px;color:var(--muted);cursor:pointer" onclick="toggleValidateForm(${fixIdx})">Cancel</button>
+            </div>
+            <div class="fb-inline-error" id="fb-error-${fixIdx}"></div>
+          </div>
+        </div>`;
+    }).join('');
+
+    return `
+      ${metaLine ? `<div style="font-size:12px;margin-bottom:10px">${metaLine}</div>` : ''}
+      ${errorNote ? `<div style="font-size:12px;margin-bottom:10px">${errorNote}</div>` : ''}
+      ${cards}
+    `;
+  }
+
+  /** Render a single reference card (shared by quick-refs and deep search) */
+  function _refCard(s, showScore) {
+    const score = showScore && s.relevance_score != null
+      ? `<span class="ref-score">relevance: ${Number(s.relevance_score).toFixed(3)}</span>` : '';
+    const dateBadge = s.date ? `<span class="badge badge-gray">${esc(s.date.slice(0, 10))}</span>` : '';
+    return `
+      <div class="ref-card">
+        <div class="ref-card-top">
+          <div>
+            <div class="ref-title">
+              ${qrefSourceIcon(s.type)}<a href="${esc(s.url)}" target="_blank" rel="noopener">${esc(s.title || s.url)}</a>
+            </div>
+            <div style="display:flex;gap:5px;margin-top:4px;flex-wrap:wrap">
+              ${refTypeBadge(s.type)}
+              ${dateBadge}
+            </div>
+          </div>
+          ${score}
+        </div>
+        ${s.snippet ? `<div class="ref-snippet">${esc(s.snippet)}</div>` : ''}
+        <div class="ref-url">${esc(s.url)}</div>
+      </div>`;
+  }
+
+  /** Render the always-on Quick References panel */
+  function renderQuickReferences(qrefData) {
+    if (!qrefData) return '<p class="no-refs">No quick references available.</p>';
+    const refs = Array.isArray(qrefData.quick_references) ? qrefData.quick_references : [];
+    const timeHtml = qrefData.search_time != null
+      ? `<span class="badge badge-gray">⏱ ${qrefData.search_time}s</span>` : '';
+    // Web search aggregate confidence badge
+    const wsConf  = qrefData.web_search_confidence;
+    const wsConfHtml = wsConf?.score != null
+      ? `<span class="badge badge-blue" title="${esc(wsConf.explanation || '')}">${Math.round(wsConf.score*100)}% relevance</span>` : '';
+    const errHtml = qrefData.error
+      ? `<div style="color:var(--danger);font-size:12px;margin-bottom:6px">⚠ ${esc(qrefData.error)}</div>` : '';
+
+    if (!refs.length) {
+      return `${errHtml}<p class="no-refs">No quick references found for this error.</p>`;
+    }
+
+    const legend = `<div style="display:flex;gap:8px;flex-wrap:wrap;align-items:center;margin-bottom:10px;font-size:12px;color:var(--muted)">
+      ${timeHtml}${wsConfHtml}
+      <span>${refs.length} reference${refs.length !== 1 ? 's' : ''} — official docs, GitHub issues &amp; PRs</span>
+    </div>`;
+
+    return legend + errHtml + `<div class="ref-list">${refs.map(r => _refCard(r, false)).join('')}</div>`;
+  }
+
+  /** Render the conditional Deep Web Search panel */
+  function renderWebSearch(webData) {
+    if (!webData) return '<p class="no-refs">Deep web search was not triggered.</p>';
+    const sources = Array.isArray(webData.sources) ? webData.sources : [];
+
+    const confidenceHtml = webData.confidence != null
+      ? `<span class="badge badge-blue">${Math.round(webData.confidence * 100)}% confidence</span>` : '';
+    const timeHtml = webData.search_time != null
+      ? `<span class="badge badge-gray">⏱ ${webData.search_time}s</span>` : '';
+    const totalHtml = webData.total_results != null
+      ? `<span style="font-size:12px;color:var(--muted)">${webData.total_results} raw results → ${sources.length} shown</span>` : '';
+    const errHtml = webData.error
+      ? `<div style="color:var(--danger);font-size:12px;margin-top:4px">⚠ ${esc(webData.error)}</div>` : '';
+
+    if (!sources.length) {
+      return `
+        <div style="display:flex;gap:6px;flex-wrap:wrap;margin-bottom:8px">${confidenceHtml}${timeHtml}</div>
+        ${totalHtml}${errHtml}
+        <p class="no-refs" style="margin-top:8px">KB confidence was sufficient — deep search not triggered.</p>
+      `;
+    }
+
+    return `
+      <div style="display:flex;gap:6px;flex-wrap:wrap;align-items:center;margin-bottom:10px">
+        ${confidenceHtml}${timeHtml}${totalHtml}
+      </div>
+      ${errHtml}
+      <div class="ref-list">${sources.map(s => _refCard(s, true)).join('')}</div>
+    `;
+  }
+
+  function renderTiming(data) {
+    const total    = data.generation_time != null ? `${data.generation_time}s` : '—';
+    const wsTime   = data.web_search?.search_time != null ? `${data.web_search.search_time}s` : '—';
+    const fixTime  = data.rca?.fixes?.generation_time != null ? `${data.rca.fixes.generation_time}s` : '—';
+    return `
+      <div class="timing-grid">
+        <div class="timing-cell">
+          <div class="t-label">Total pipeline</div>
+          <div class="t-value">${esc(total)}</div>
+        </div>
+        <div class="timing-cell">
+          <div class="t-label">Web search</div>
+          <div class="t-value">${esc(wsTime)}</div>
+        </div>
+        <div class="timing-cell">
+          <div class="t-label">Fix generation</div>
+          <div class="t-value">${esc(fixTime)}</div>
+        </div>
+      </div>
+    `;
+  }
+
+  // ── Feedback ────────────────────────────────────────────────────────────────
+
+  let _lastErrorType = '';
+  let _lastRcaCtx   = null;  // stores last full diagnosis result for feedback context
+
+  async function sendFeedback(btn, fixType, errorType, success) {
+    const et = errorType || _lastErrorType || '';
+    try {
+      await fetch('/api/feedback', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ fix_type: fixType, error_type: et, success }),
+      });
+      btn.classList.add(success ? 'applied' : 'dismissed');
+      btn.disabled = true;
+    } catch (_) { /* non-fatal */ }
+  }
+
+  // ── Validate Fix human feedback ─────────────────────────────────────────────
+
+  function toggleValidateForm(fixIdx) {
+    const container = document.getElementById(`fb-form-${fixIdx}`);
+    const btn       = document.getElementById(`btn-validate-${fixIdx}`);
+    if (!container) return;
+    const isOpen = container.classList.toggle('open');
+    if (btn && !btn.classList.contains('validated')) {
+      btn.textContent = isOpen ? '▲ Close' : '✎ Validate Fix';
+    }
+  }
+
+  async function submitValidateFeedback(fixIdx) {
+    const ctx   = _lastRcaCtx;
+    const fixes = ctx?.rca?.fixes?.fixes || [];
+    const fix   = fixes[fixIdx];
+    if (!fix || !ctx) {
+      document.getElementById(`fb-error-${fixIdx}`).textContent =
+        'No RCA context found. Please re-run diagnosis.';
+      return;
+    }
+
+    const getRadio = name => {
+      const el = document.querySelector(`input[name="${name}"]:checked`);
+      return el ? el.value : null;
+    };
+
+    const rcc     = getRadio(`rcc-${fixIdx}`);
+    const fc      = getRadio(`fc-${fixIdx}`);
+    const ri      = getRadio(`ri-${fixIdx}`);
+    const rating  = getRadio(`rating-${fixIdx}`);
+    const comment = document.getElementById(`fb-comment-${fixIdx}`)?.value || '';
+    const errorEl = document.getElementById(`fb-error-${fixIdx}`);
+    errorEl.textContent = '';
+
+    if (!rcc || !fc || !ri || !rating) {
+      errorEl.textContent = 'Please answer all questions and provide a rating.';
+      return;
+    }
+
+    const submitBtn = document.getElementById(`btn-fb-submit-${fixIdx}`);
+    submitBtn.disabled = true;
+
+    const payload = {
+      workflow_id:        String(ctx.run?.run_id ?? ''),
+      repository:         ctx.run?.repository     ?? '',
+      error_type:         ctx.rca?.error_type      ?? ctx.rca?.failure_type ?? '',
+      error_signature:    ctx.error_signature      ?? '',
+      fix_rank:           fix.rank || (fixIdx + 1),
+      fix_description:    fix.description          ?? '',
+      root_cause_correct: rcc,
+      fix_correct:        fc,
+      resolved_issue:     ri,
+      confidence:         fix.confidence_report?.score ?? fix.final_score ?? 0,
+      rating:             parseInt(rating, 10),
+      feedback_comment:   comment,
+      model:              ctx.rca?.source          ?? '',
+    };
+
+    try {
+      const resp = await fetch('/api/user-feedback', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || 'Submission failed');
+
+      // Success: replace button, collapse form
+      const validateBtn = document.getElementById(`btn-validate-${fixIdx}`);
+      if (validateBtn) {
+        validateBtn.textContent = '✓ Validated';
+        validateBtn.classList.add('validated');
+        validateBtn.disabled = true;
       }
-      return items.map((item) => {
-        if (typeof item === 'string') {
-          return `- ${item}`;
+      const container = document.getElementById(`fb-form-${fixIdx}`);
+      if (container) container.classList.remove('open');
+
+    } catch (err) {
+      errorEl.textContent = `⚠ ${err.message}`;
+      submitBtn.disabled  = false;
+    }
+  }
+
+  // ── Automated validation (Track B) ─────────────────────────────────────────
+
+  let _validationEnabled = false;
+
+  async function checkValidationStatus() {
+    try {
+      const resp = await fetch('/api/validate/status');
+      const data = await resp.json();
+      _validationEnabled = data.tier2_enabled === true;
+
+      const liveToggle = document.getElementById('val-live-mode');
+      const liveLabel  = document.getElementById('val-live-label');
+      const statusEl   = document.getElementById('validate-live-status');
+
+      if (!liveToggle || !liveLabel) return;
+
+      if (_validationEnabled) {
+        liveToggle.disabled = false;
+        liveToggle.title    = '';
+        liveLabel.textContent = 'Live validation is enabled — toggle to opt in';
+        liveLabel.style.color = 'var(--ok)';
+        if (statusEl) {
+          statusEl.textContent  = '✓ ' + (data.message || 'Live validation is enabled.');
+          statusEl.style.color  = 'var(--ok)';
+          statusEl.style.background = 'var(--ok-light)';
+          statusEl.style.borderColor = 'var(--ok)';
         }
-        const line = item.line ? `line ${item.line}: ` : '';
-        return `- ${line}${item.message || ''}`;
-      }).join('\n');
-    }
-
-    function formatInlineFixes(items) {
-      if (!Array.isArray(items) || items.length === 0) {
-        return '-';
-      }
-      return items.map((item) => {
-        if (typeof item === 'string') {
-          return `- ${item}`;
+      } else {
+        liveToggle.disabled = true;
+        liveToggle.checked  = false;
+        liveToggle.classList.add('toggle-disabled');
+        liveToggle.title    = 'Live validation must be enabled by your administrator (TIER2_ENABLED=true in .env)';
+        liveLabel.textContent = 'Live validation disabled — contact your administrator';
+        liveLabel.style.color = 'var(--muted)';
+        if (statusEl) {
+          statusEl.textContent  = '⚠ ' + (data.message || 'Live validation is disabled.');
+          statusEl.style.color  = 'var(--warn)';
+          statusEl.style.background = 'var(--warn-light)';
+          statusEl.style.borderColor = 'var(--warn)';
         }
-        const parts = [
-          item.target ? `Target: ${item.target}` : null,
-          item.suggested_change ? `Fix: ${item.suggested_change}` : null,
-          item.rationale ? `Why: ${item.rationale}` : null
-        ].filter(Boolean);
-        return `- ${parts.join('\n  ') || '-'}`;
-      }).join('\n');
-    }
-
-    function formatRca(rca) {
-      const location = rca.failure_location || {};
-      const locationParts = [
-        location.job ? `Job: ${location.job}` : null,
-        location.log_file ? `Log file: ${location.log_file}` : null,
-        location.line ? `Line: ${location.line}` : null,
-        location.line_range ? `Failure block: ${location.line_range}` : null
-      ].filter(Boolean);
-
-      return [
-        `RCA Summary\n${rca.rca_summary || rca.root_cause || '-'}`,
-        `Failure Details\nStage: ${rca.failure_stage || '-'}\nType: ${rca.failure_type || rca.error_type || '-'}\nError code: ${rca.error_code || '-'}\nSeverity: ${rca.severity || '-'}\nConfidence: ${rca.confidence || '-'}`,
-        `Failure Location\n${locationParts.join('\n') || '-'}`,
-        `Evidence\n${formatEvidence(rca.evidence)}`,
-        `Remediation Steps\n${formatList(rca.remediation_steps)}`,
-        `Inline Fix Suggestions\n${formatInlineFixes(rca.inline_fix_suggestions || rca.inline_fixes || rca.suggested_fixes)}`,
-        `Verification\n${formatList(rca.verification_commands)}`
-      ].join('\n\n');
-    }
-
-    form.addEventListener('submit', async (event) => {
-      event.preventDefault();
-      submit.disabled = true;
-      statusEl.textContent = 'Collecting logs and diagnosing...';
-      statusEl.className = 'status';
-      output.textContent = '{}';
-
-      const formData = new FormData(form);
-      const payload = {
-        run_url: formData.get('run_url'),
-        github_token: formData.get('github_token'),
-        model_id: formData.get('model_id'),
-        use_model: formData.get('use_model') === 'on'
-      };
-
-      try {
-        const response = await fetch('/api/diagnose', {
-          method: 'POST',
-          headers: {'Content-Type': 'application/json'},
-          body: JSON.stringify(payload)
-        });
-        const data = await response.json();
-        if (!response.ok) {
-          throw new Error(data.error || 'Diagnosis failed');
-        }
-        metrics[0].textContent = data.run?.run_id || '-';
-        metrics[1].textContent = data.signal_count ?? '-';
-        metrics[2].textContent = data.failure_block_count ?? '-';
-        output.textContent = formatRca(data.rca || {});
-        statusEl.textContent = 'Complete';
-        statusEl.className = 'status ok';
-      } catch (error) {
-        statusEl.textContent = error.message;
-        statusEl.className = 'status error';
-      } finally {
-        submit.disabled = false;
       }
+    } catch (_) { /* non-fatal — leave toggle disabled */ }
+  }
+
+  function toggleAllRanks(allCheckbox) {
+    document.querySelectorAll('.val-rank-cb').forEach(cb => {
+      cb.checked = allCheckbox.checked;
     });
-  </script>
+  }
+
+  async function submitValidation() {
+    const ctx = _lastRcaCtx;
+    if (!ctx) {
+      document.getElementById('val-error').textContent = 'No RCA context. Please run diagnosis first.';
+      return;
+    }
+
+    const forkRepo  = document.getElementById('val-fork-repo')?.value.trim()  || '';
+    const branch    = document.getElementById('val-branch')?.value.trim()     || 'main';
+    const username  = document.getElementById('val-username')?.value.trim()   || '';
+    const token     = document.getElementById('val-token')?.value.trim()      || '';
+    const liveMode  = document.getElementById('val-live-mode')?.checked       || false;
+    const errorEl   = document.getElementById('val-error');
+    errorEl.textContent = '';
+
+    if (!forkRepo) { errorEl.textContent = 'Fork repository is required.'; return; }
+    if (!username) { errorEl.textContent = 'GitHub username is required.'; return; }
+
+    // Collect fix ranks
+    const allChecked = document.getElementById('val-rank-all')?.checked;
+    const fixRanks   = allChecked
+      ? 'all'
+      : Array.from(document.querySelectorAll('.val-rank-cb:checked')).map(cb => parseInt(cb.value, 10));
+
+    const fixes = ctx.rca?.fixes?.fixes || [];
+
+    const payload = {
+      fork_repo:       forkRepo,
+      branch:          branch,
+      github_username: username,
+      token:           token || undefined,
+      error_signature: ctx.error_signature || '',
+      fix_ranks:       fixRanks,
+      fixes:           fixes,
+      workflow_id:     String(ctx.run?.run_id ?? '0'),
+      live_mode:       liveMode,
+    };
+
+    const btn = document.getElementById('btn-run-validation');
+    if (btn) { btn.disabled = true; btn.textContent = '⏳ Running…'; }
+
+    try {
+      const resp = await fetch('/api/validate', {
+        method:  'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body:    JSON.stringify(payload),
+      });
+      const data = await resp.json();
+
+      // Show sec-validate and populate results
+      const secValidate = document.getElementById('sec-validate');
+      if (secValidate) secValidate.style.display = '';
+
+      const resContent = document.getElementById('validate-results-content');
+      if (resContent) resContent.innerHTML = renderValidationResults(data);
+
+    } catch (err) {
+      errorEl.textContent = `⚠ ${err.message}`;
+    } finally {
+      if (btn) { btn.disabled = false; btn.textContent = '▶ Run Automated Validation'; }
+    }
+  }
+
+  function renderValidationResults(data) {
+    if (data.status === 'not_enabled') {
+      return `<div style="padding:10px 12px;background:var(--warn-light);border-radius:6px;color:var(--warn);font-size:13px;">
+        ⚠ ${esc(data.message || 'Live validation is not enabled.')}
+      </div>`;
+    }
+    if (data.status === 'queued') {
+      return `<div style="padding:10px 12px;background:var(--ok-light);border-radius:6px;color:var(--ok);font-size:13px;margin-bottom:10px;">
+        ✓ ${esc(data.message || 'Validation queued.')}
+        ${data.run_id ? `<br><strong>Original Run ID:</strong> ${esc(data.run_id)}` : ''}
+        ${data.fork_repo ? `<br><strong>Fork:</strong> ${esc(data.fork_repo)} / branch: ${esc(data.branch || '')}` : ''}
+      </div>
+      <p style="font-size:12px;color:var(--muted)">A PR has been raised on your fork. The action run will be tracked automatically.</p>`;
+    }
+    if (data.status === 'error') {
+      return `<div style="padding:10px 12px;background:var(--danger-light);border-radius:6px;color:var(--danger);font-size:13px;">
+        ✗ ${esc(data.message || 'Validation error.')}
+      </div>`;
+    }
+    return `<p class="no-refs">${esc(JSON.stringify(data))}</p>`;
+  }
+  // ── Session Storage Persistence ─────────────────────────────────────────
+  // Store RCA state in sessionStorage to persist across tab switches
+
+  const RCA_SESSION_KEY = 'rca_session_state';
+
+  function buildRcaSessionState() {
+    const state = {
+      diagnosis_form: {
+        run_url: document.querySelector('[name="run_url"]')?.value || '',
+        github_username: document.querySelector('[name="github_username"]')?.value || '',
+        github_token: document.querySelector('[name="github_token"]')?.value || '',
+        use_model: document.querySelector('[name="use_model"]')?.checked || false,
+      },
+      rca_data: _lastRcaCtx ? { ..._lastRcaCtx } : null,
+      error_type: _lastErrorType,
+      section_states: {
+        'sec-rca': !document.getElementById('sec-rca')?.classList.contains('collapsed'),
+        'sec-fixes': !document.getElementById('sec-fixes')?.classList.contains('collapsed'),
+        'sec-qref': !document.getElementById('sec-qref')?.classList.contains('collapsed'),
+        'sec-web': !document.getElementById('sec-web')?.classList.contains('collapsed'),
+        'sec-validate': !document.getElementById('sec-validate')?.classList.contains('collapsed'),
+        'sec-timing': !document.getElementById('sec-timing')?.classList.contains('collapsed'),
+      },
+      validation_form: {
+        fork_repo: document.getElementById('val-fork-repo')?.value || '',
+        branch: document.getElementById('val-branch')?.value || 'main',
+        username: document.getElementById('val-username')?.value || '',
+        token: document.getElementById('val-token')?.value || '',
+        live_mode: document.getElementById('val-live-mode')?.checked || false,
+      },
+      metrics: {
+        repo: document.getElementById('m-repo')?.textContent || '—',
+        run: document.getElementById('m-run')?.textContent || '—',
+        signals: document.getElementById('m-signals')?.textContent || '—',
+        blocks: document.getElementById('m-blocks')?.textContent || '—',
+        kb: document.getElementById('m-kb')?.textContent || '—',
+        time: document.getElementById('m-time')?.textContent || '—',
+      },
+      status_badge: {
+        text: document.getElementById('status-badge')?.textContent || 'Idle',
+        class: document.getElementById('status-badge')?.className || 'status-badge',
+      },
+      idle_state_visible: document.getElementById('idle-state')?.style.display !== 'none',
+      report_body_visible: document.getElementById('report-body')?.style.display !== 'none',
+      web_section_visible: document.getElementById('sec-web')?.style.display !== 'none',
+      validate_section_visible: document.getElementById('sec-validate')?.style.display !== 'none',
+    };
+    return state;
+  }
+
+  function saveRcaSessionState() {
+    try {
+      const state = buildRcaSessionState();
+      sessionStorage.setItem(RCA_SESSION_KEY, JSON.stringify(state));
+    } catch (err) {
+      console.warn('Failed to save RCA session state:', err);
+    }
+  }
+
+  function restoreRcaSessionState() {
+    try {
+      const stored = sessionStorage.getItem(RCA_SESSION_KEY);
+      if (!stored) return; // No saved state
+
+      const state = JSON.parse(stored);
+      if (!state || typeof state !== 'object') return; // Invalid state structure
+
+      // Restore diagnosis form fields
+      if (state.diagnosis_form && typeof state.diagnosis_form === 'object') {
+        const runUrl = document.querySelector('[name="run_url"]');
+        const username = document.querySelector('[name="github_username"]');
+        const token = document.querySelector('[name="github_token"]');
+        const useModel = document.querySelector('[name="use_model"]');
+
+        if (runUrl) runUrl.value = state.diagnosis_form.run_url || '';
+        if (username) username.value = state.diagnosis_form.github_username || '';
+        if (token) token.value = state.diagnosis_form.github_token || '';
+        if (useModel) useModel.checked = state.diagnosis_form.use_model || false;
+      }
+
+      // Restore RCA data context
+      if (state.rca_data) {
+        _lastRcaCtx = state.rca_data;
+        _lastErrorType = state.error_type || '';
+      }
+
+      // Restore metrics display
+      if (state.metrics) {
+        const metricsMap = {
+          'repo': 'm-repo',
+          'run': 'm-run',
+          'signals': 'm-signals',
+          'blocks': 'm-blocks',
+          'kb': 'm-kb',
+          'time': 'm-time',
+        };
+        for (const [key, elementId] of Object.entries(metricsMap)) {
+          const el = document.getElementById(elementId);
+          if (el && state.metrics[key]) el.textContent = state.metrics[key];
+        }
+      }
+
+      // Restore status badge
+      if (state.status_badge) {
+        const badge = document.getElementById('status-badge');
+        if (badge) {
+          badge.textContent = state.status_badge.text || 'Idle';
+          badge.className = state.status_badge.class || 'status-badge';
+        }
+      }
+
+      // Restore idle/report visibility
+      const idleState = document.getElementById('idle-state');
+      const reportBody = document.getElementById('report-body');
+      if (idleState) idleState.style.display = state.idle_state_visible ? '' : 'none';
+      if (reportBody) reportBody.style.display = state.report_body_visible ? 'grid' : 'none';
+
+      // Restore section visibility (web and validate sections)
+      const webSection = document.getElementById('sec-web');
+      const validateSection = document.getElementById('sec-validate');
+      if (webSection) webSection.style.display = state.web_section_visible ? '' : 'none';
+      if (validateSection) validateSection.style.display = state.validate_section_visible ? '' : 'none';
+
+      // Restore RCA content if data exists
+      if (state.rca_data) {
+        document.getElementById('rca-content').innerHTML = renderRca(state.rca_data.rca || {});
+        document.getElementById('fixes-content').innerHTML = renderFixes(state.rca_data.rca?.fixes || null);
+        document.getElementById('qref-content').innerHTML = renderQuickReferences(state.rca_data.quick_references || null);
+        document.getElementById('web-content').innerHTML = renderWebSearch(state.rca_data.web_search || null);
+        document.getElementById('timing-content').innerHTML = renderTiming(state.rca_data);
+      }
+
+      // Restore section collapse/expand states
+      if (state.section_states) {
+        for (const [sectionId, isExpanded] of Object.entries(state.section_states)) {
+          const section = document.getElementById(sectionId);
+          if (section) {
+            if (isExpanded) {
+              section.classList.remove('collapsed');
+            } else {
+              section.classList.add('collapsed');
+            }
+          }
+        }
+      }
+
+      // Restore validation form fields
+      if (state.validation_form && typeof state.validation_form === 'object') {
+        const forkRepo = document.getElementById('val-fork-repo');
+        const branch = document.getElementById('val-branch');
+        const valUsername = document.getElementById('val-username');
+        const valToken = document.getElementById('val-token');
+        const liveModeCheckbox = document.getElementById('val-live-mode');
+
+        if (forkRepo) forkRepo.value = state.validation_form.fork_repo || '';
+        if (branch) branch.value = state.validation_form.branch || 'main';
+        if (valUsername) valUsername.value = state.validation_form.username || '';
+        if (valToken) valToken.value = state.validation_form.token || '';
+        if (liveModeCheckbox) liveModeCheckbox.checked = state.validation_form.live_mode || false;
+      }
+    } catch (err) {
+      console.warn('Failed to restore RCA session state:', err);
+      // Continue without restoration - page still works
+    }
+  }
+
+
+
+  // ── Form submission ─────────────────────────────────────────────────────────
+
+  const form       = document.getElementById('diagnosis-form');
+  const submitBtn  = document.getElementById('submit-btn');
+  const statusBadge = document.getElementById('status-badge');
+
+  function setStatus(text, cls) {
+    statusBadge.textContent = text;
+    statusBadge.className = 'status-badge ' + (cls || '');
+  }
+
+  form.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    submitBtn.disabled = true;
+    setStatus('Running…', 'running');
+
+    // Clear previous session state on new submission
+    sessionStorage.removeItem(RCA_SESSION_KEY);
+
+    // Reset display
+    document.getElementById('idle-state').style.display = 'none';
+    document.getElementById('report-body').style.display = 'none';
+    ['m-repo','m-run','m-signals','m-blocks','m-kb','m-time'].forEach(id => {
+      document.getElementById(id).textContent = '—';
+    });
+
+    const fd = new FormData(form);
+    const payload = {
+      run_url:      fd.get('run_url'),
+      github_token: fd.get('github_token'),
+      model_id:     fd.get('model_id'),
+      use_model:    fd.get('use_model') === 'on',
+    };
+
+    try {
+      const resp = await fetch('/api/diagnose', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      const data = await resp.json();
+      if (!resp.ok) throw new Error(data.error || 'Diagnosis failed');
+
+      // ── Metrics strip — include repository name ──
+      document.getElementById('m-repo').textContent    = data.run?.repository || '—';
+      document.getElementById('m-run').textContent     = data.run?.run_id     || '—';
+      document.getElementById('m-signals').textContent = data.signal_count    ?? '—';
+      document.getElementById('m-blocks').textContent  = data.failure_block_count ?? '—';
+      document.getElementById('m-kb').textContent      = data.kb_hits         ?? '—';
+      document.getElementById('m-time').textContent    = data.generation_time != null
+        ? `${data.generation_time}s` : '—';
+
+      // ── Cache error type for feedback ──
+      _lastErrorType = data.rca?.error_type || data.rca?.failure_type || '';
+      _lastRcaCtx    = data;  // cache for feedback form context
+
+      // ── Render sections ──
+      document.getElementById('rca-content').innerHTML   = renderRca(data.rca || {});
+      document.getElementById('fixes-content').innerHTML = renderFixes(data.rca?.fixes || null);
+      document.getElementById('qref-content').innerHTML  = renderQuickReferences(data.quick_references || null);
+      document.getElementById('web-content').innerHTML   = renderWebSearch(data.web_search || null);
+      document.getElementById('timing-content').innerHTML = renderTiming(data);
+
+      // ── Show automated validation sub-panel and pre-fill fields ──
+      const valSubpanel = document.getElementById('validate-subpanel');
+      if (valSubpanel) {
+        valSubpanel.style.display = '';
+        // Pre-fill username and token from the diagnosis form
+        const formUsername = document.querySelector('[name=github_username]')?.value || '';
+        const formToken    = document.querySelector('[name=github_token]')?.value    || '';
+        const usernameEl   = document.getElementById('val-username');
+        const tokenEl      = document.getElementById('val-token');
+        if (usernameEl && !usernameEl.value) usernameEl.value = formUsername;
+        if (tokenEl    && !tokenEl.value)    tokenEl.value    = formToken;
+      }
+
+      document.getElementById('report-body').style.display = 'grid';
+      setStatus('Complete', 'ok');
+
+      // Save RCA state to sessionStorage
+      saveRcaSessionState();
+
+    } catch (err) {
+      document.getElementById('idle-state').style.display = 'block';
+      document.getElementById('idle-state').innerHTML = `
+        <div class="idle-hint">
+          <div class="icon" style="color:var(--danger)">⚠</div>
+          <p style="color:var(--danger)">${esc(err.message)}</p>
+        </div>`;
+      setStatus('Error', 'error');
+    } finally {
+      submitBtn.disabled = false;
+    }
+  });
+
+  // ── Add auto-save to form inputs ────────────────────────────────────────
+  document.querySelectorAll('[name="run_url"], [name="github_username"], [name="github_token"], [name="use_model"]').forEach(input => {
+    input.addEventListener('change', saveRcaSessionState);
+  });
+
+  document.querySelectorAll('#val-fork-repo, #val-branch, #val-username, #val-token, #val-live-mode').forEach(input => {
+    input.addEventListener('change', saveRcaSessionState);
+  });
+
+  // ── Call validation status probe on page load ──────────────────────────────
+  document.addEventListener('DOMContentLoaded', () => {
+    restoreRcaSessionState();
+    checkValidationStatus();
+  });
+  // Trigger immediately in case DOMContentLoaded already fired (inline script)
+  if (document.readyState !== 'loading') {
+    restoreRcaSessionState();
+    checkValidationStatus();
+  }
+
+  // ── KB Batch Update button ──────────────────────────────────────────────
+  document.getElementById('kb-update-btn').addEventListener('click', async () => {
+    const btn       = document.getElementById('kb-update-btn');
+    const statusEl  = document.getElementById('kb-update-status');
+    btn.disabled    = true;
+    statusEl.textContent = 'Running KB update…';
+    statusEl.style.color = 'var(--muted)';
+    try {
+      const resp = await fetch('/api/admin/kb-update', { method: 'POST' });
+      const result = await resp.json();
+      if (!resp.ok) throw new Error(result.error || 'KB update failed');
+      statusEl.textContent =
+        `✓ Done — ${result.processed ?? 0} processed, ${result.skipped ?? 0} skipped` +
+        (result.errors?.length ? `, ${result.errors.length} error(s)` : '');
+      statusEl.style.color = 'var(--ok)';
+    } catch (err) {
+      statusEl.textContent = `⚠ ${err.message}`;
+      statusEl.style.color = 'var(--danger)';
+    } finally {
+      btn.disabled = false;
+      setTimeout(() => { statusEl.textContent = ''; }, 8000);
+    }
+  });
+</script>
+
 </body>
 </html>

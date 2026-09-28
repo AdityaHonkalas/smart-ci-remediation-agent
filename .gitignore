@@ -21,5 +21,13 @@ data/*.tmp
 data/metadata
 data/chroma_store
 data/rca_knowledge_base
+data/fix_success_rates.json
+data/rca_staging_archive.json
+data/rca_staging_queue.json
+data/repo_list.txt
 docs
 *.docx
+diagrams
+logs
+output
+plan

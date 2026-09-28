@@ -1,12 +1,30 @@
 #!/usr/bin/env python3
 """Pre-process collected GitHub Actions logs for CI failure RCA.
 
-Revised pipeline (per REVISED_ARCHITECTURE_PLAN.md):
-  Step 1  Log Normalization      — clean ANSI, timestamps, control chars
-  Step 2  Error Block Extraction — pattern-matched blocks with ±10-line context
-  Step 3  Context Enrichment     — CI/repo metadata, severity, impact
-  Step 4  Error Signature        — SHA-256 hash + human-readable label
-  Step 5  Vector Embedding       — sentence-transformers/all-MiniLM-L6-v2 (384-dim)
+Redesigned pipeline:
+  Step 1  Log Normalization          — clean ANSI, timestamps, control chars
+  Step 2  Workflow-aware Segmentation — segment log into workflow → job → step → command
+                                        hierarchy using marker patterns from config
+  Step 3  Failure Event Construction — group related error lines, stack traces, and
+                                        metadata into FailureEvents using start/end markers;
+                                        context preserved from failure-start to failure-end
+                                        (no fixed window truncation)
+  Step 4  Hierarchical Severity Score — score blocks via curated failure taxonomy tiers
+                                        (critical/high/medium/low) rather than flat weights
+  Step 5  Root-cause Validation      — filter terminal status noise (exit codes, "job
+                                        failed" wrappers) so only causal errors remain
+  Step 6  Context Enrichment         — CI/repo metadata, language, framework, impact
+  Step 7  Error Signature            — SHA-256 hash + human-readable label
+  Step 8  Semantic Deduplication     — compare new errors against ChromaDB KB; skip
+                                        near-duplicates above similarity threshold
+  Step 9  Vector Embedding           — sentence-transformers/all-MiniLM-L6-v2 (384-dim)
+
+Context window policy:
+  Every failure event preserves the complete log context from the line where a
+  failure-start marker is detected up to (and including) the line where the
+  matching failure-end marker is detected.  If no end marker is found within
+  the causal window defined in failure_signal_patterns.json, the block closes at
+  the next unrelated section boundary.  No fixed ±N-line truncation is applied.
 
 Pipeline outputs:
 - preprocessed_logs.jsonl   : cleaned failure excerpts
@@ -37,7 +55,7 @@ from dataclasses import asdict, dataclass, field
 from pathlib import Path
 from typing import Any, Iterable
 
-from db import LocalVectorDB, ChromaVectorDB, _Embedder as _SentenceEmbedder
+from db import ChromaVectorDB, _Embedder as _SentenceEmbedder
 from env_loader import load_dotenv
 
 logger = logging.getLogger(__name__)
@@ -97,6 +115,10 @@ GITHUB_COMMAND_RE = re.compile(r"^(?:##\[(?:debug|command|section|notice|warning
 DEBUG_RE = re.compile(r"^(?:debug\b|trace\b|verbose\b|##\[debug\]|::debug\b)", re.I)
 CONTROL_CHAR_RE = re.compile(r"[\x00-\x08\x0b\x0c\x0e-\x1f]")
 LEADING_STEP_RE = re.compile(r"^\s*(?:Run|shell:|env:)\s+", re.I)
+
+# ---------------------------------------------------------------------------
+# Compiled pattern sets from failure_signal_patterns.json
+# ---------------------------------------------------------------------------
 FAILURE_BLOCK_END_RE = compile_pattern_entry(PATTERN_CONFIG["failure_block_end_pattern"])
 FAILURE_BLOCK_PATTERNS = compile_named_patterns(PATTERN_CONFIG, "failure_block_patterns")
 ERROR_PATTERNS = compile_named_patterns(PATTERN_CONFIG, "error_patterns")
@@ -110,6 +132,63 @@ ERROR_CODE_SIGNALS = {
     for key, values in PATTERN_CONFIG.get("error_code_signals", {}).items()
 }
 SEVERITY_SIGNALS = PATTERN_CONFIG.get("severity_signals", {})
+
+# Failure start/end markers (new – used by FailureEventBuilder)
+_FAILURE_START_MARKERS: list[tuple[str, re.Pattern[str], str, bool]] = []
+for _entry in PATTERN_CONFIG.get("failure_block_start_markers", []):
+    _FAILURE_START_MARKERS.append((
+        str(_entry["name"]),
+        compile_pattern_entry(_entry),
+        str(_entry.get("severity_tier", "medium")),
+        bool(_entry.get("is_terminal", False)),
+    ))
+
+_FAILURE_END_MARKERS: list[tuple[str, re.Pattern[str], bool, bool]] = []
+for _entry in PATTERN_CONFIG.get("failure_block_end_markers", []):
+    _FAILURE_END_MARKERS.append((
+        str(_entry["name"]),
+        compile_pattern_entry(_entry),
+        bool(_entry.get("terminates_all", False)),
+        bool(_entry.get("is_cascade_noise", False)),
+    ))
+
+# Terminal noise patterns – lines that describe cascade/wrap, not root cause
+_TERMINAL_NOISE_PATTERNS: list[re.Pattern[str]] = [
+    compile_pattern_entry(e) for e in PATTERN_CONFIG.get("terminal_noise_patterns", [])
+]
+
+# Workflow segmentation markers
+_WF_MARKERS = PATTERN_CONFIG.get("workflow_step_markers", {})
+_STEP_START_RE = compile_pattern_entry(_WF_MARKERS["step_start"])   if "step_start"  in _WF_MARKERS else None
+_STEP_END_RE   = compile_pattern_entry(_WF_MARKERS["step_end"])     if "step_end"    in _WF_MARKERS else None
+_JOB_START_RE  = compile_pattern_entry(_WF_MARKERS["job_start"])    if "job_start"   in _WF_MARKERS else None
+_CMD_RUN_RE    = compile_pattern_entry(_WF_MARKERS["command_run"])  if "command_run" in _WF_MARKERS else None
+
+# Causal link patterns
+_CAUSAL_LINK_PATTERNS: list[tuple[str, re.Pattern[str]]] = []
+for _cname, _centry in PATTERN_CONFIG.get("causal_link_patterns", {}).items():
+    _CAUSAL_LINK_PATTERNS.append((_cname, compile_pattern_entry(_centry)))
+
+# Stack trace patterns per language
+_STACK_TRACE_LANG_RES: dict[str, re.Pattern[str]] = {
+    lang: re.compile(spec["frame_pattern"], compile_flags(spec.get("flags")))
+    for lang, spec in PATTERN_CONFIG.get("stack_trace_patterns", {}).items()
+}
+
+# Failure taxonomy – tiers drive hierarchical severity scoring
+_FAILURE_TAXONOMY: dict[str, Any] = PATTERN_CONFIG.get("failure_taxonomy", {})
+_TAXONOMY_TIERS: dict[str, dict[str, Any]] = _FAILURE_TAXONOMY.get("tiers", {})
+_ROOT_CAUSE_TYPES_TAXONOMY: frozenset[str] = frozenset(_FAILURE_TAXONOMY.get("root_cause_types", []))
+_CASCADING_TYPES_TAXONOMY: frozenset[str]  = frozenset(_FAILURE_TAXONOMY.get("cascading_types", []))
+_TERMINAL_NOISE_TYPES: frozenset[str]      = frozenset(_FAILURE_TAXONOMY.get("terminal_noise_types", []))
+
+# Semantic similarity threshold for deduplication
+_SEMANTIC_SIM_THRESHOLD: float = float(PATTERN_CONFIG.get("semantic_similarity_threshold", 0.85))
+# Max causal window (lines) for failure block boundary detection
+_CAUSAL_WINDOW_LINES: int = int(PATTERN_CONFIG.get("causal_window_lines", 15))
+# Max stack trace depth
+_MAX_STACK_DEPTH: int = int(PATTERN_CONFIG.get("max_stack_trace_depth", 50))
+
 DATASET_FILE_SUFFIXES = {".csv", ".jsonl", ".ndjson", ".json"}
 
 
@@ -1310,52 +1389,77 @@ def resolve_zip_path(data_dir: Path, run_metadata: dict[str, Any]) -> Path | Non
     return path
 
 
+
 # ===========================================================================
-# Revised Architecture – Data Processing Pipeline Components
-# (REVISED_ARCHITECTURE_PLAN.md §2)
+# Redesigned Architecture - Data Processing Pipeline Components
 # ===========================================================================
+
+# ---------------------------------------------------------------------------
+# Step 2 data structures
+# ---------------------------------------------------------------------------
+
+@dataclass
+class WorkflowLocation:
+    """Hierarchical location within a CI workflow log."""
+    workflow: str = ""      # workflow name (from run metadata)
+    job: str = ""           # job name (inferred from file / group header)
+    step: str = ""          # step name (from ::group:: / ##[group] marker)
+    command: str = ""       # command being executed (from ##[command] / $ marker)
+
 
 @dataclass
 class ErrorBlock:
     """
-    Step 2 output: a single extracted error block with full context.
+    A single extracted failure event with complete context.
 
-    Mirrors the EnrichedErrorBlock schema from the revised architecture plan.
+    Context policy (change #9):
+      context_before / context_after are NOT limited to a fixed +-N window.
+      They hold every log line from the failure-start marker up to the error
+      line (before) and from the error line to the failure-end marker (after).
+      This guarantees no information is truncated across a failure block.
+
+    rca_weight -- hierarchical score [0-100] assigned by HierarchicalSeverityScorer.
+    The block with the highest weight is the root cause / primary error.
     """
-    error_type: str                   # e.g. 'ImportError', 'TestFailure'
-    error_message: str                # Primary error message text
-    error_code: str                   # Error code if present, else ''
-    stack_trace: list[str]            # Stack trace lines (may be empty)
-    context_before: list[str]         # Up to 10 lines before the error
-    context_after: list[str]          # Up to 10 lines after the error
-    file_path: str                    # File where error occurred ('' if unknown)
-    line_number: int | None           # Log line number (None if unknown)
-    timestamp: str                    # ISO-8601 UTC timestamp of extraction
-    # Enrichment fields (Step 3)
+    error_type: str                     # e.g. 'java_exception', 'python_exception'
+    error_message: str                  # Primary error message text
+    error_code: str                     # Error code if present, else ''
+    stack_trace: list[str]              # Stack trace lines (may be empty)
+    context_before: list[str]           # All lines from block-start to error line
+    context_after: list[str]            # All lines from error line to block-end
+    file_path: str                      # File where error occurred ('' if unknown)
+    line_number: int | None             # Log line number (None if unknown)
+    timestamp: str                      # ISO-8601 UTC timestamp of extraction
+    # Workflow location (change #1)
+    location: WorkflowLocation = field(default_factory=WorkflowLocation)
+    # Start/end marker names that bounded this block (change #8)
+    start_marker: str = ""
+    end_marker: str = ""
+    start_line_number: int = 0          # absolute log line where block started
+    end_line_number: int = 0            # absolute log line where block ended
+    # Enrichment fields (Step 6)
     repository: str = ""
     language: str = ""
     framework: str = ""
     ci_environment: dict[str, Any] = field(default_factory=dict)
     dependencies: list[dict[str, str]] = field(default_factory=list)
-    severity: str = "low"             # 'critical' | 'high' | 'medium' | 'low'
-    impact_scope: str = "unknown"     # 'build' | 'test' | 'deployment'
+    severity: str = "low"               # 'critical' | 'high' | 'medium' | 'low'
+    impact_scope: str = "unknown"       # 'build' | 'test' | 'deployment'
+    rca_weight: int = 0                 # [0-100] root-cause weight; highest = primary
+    is_terminal_noise: bool = False     # True -> filtered out before RCA
 
 
 @dataclass
 class ErrorSignatureResult:
-    """
-    Step 4 output: deterministic error signature for deduplication.
-    """
+    """Step 7 output: deterministic error signature for deduplication."""
     hash: str             # SHA-256 hash of normalised error components
-    readable: str         # e.g. 'ImportError_module_not_found_sklearn'
+    readable: str         # e.g. 'java_exception_nullpointer_main'
     components: dict[str, str] = field(default_factory=dict)
 
 
 @dataclass
 class EmbeddingResult:
-    """
-    Step 5 output: 384-dimensional L2-normalised embeddings.
-    """
+    """Step 9 output: 384-dimensional L2-normalised embeddings."""
     error_embedding: list[float]      # Shape: (384,)
     context_embedding: list[float]    # Shape: (384,)
     combined_embedding: list[float]   # Shape: (384,)
@@ -1365,25 +1469,24 @@ class EmbeddingResult:
 class ProcessedLog:
     """
     Complete output of the PreprocessingPipeline for a single CI log.
-
     Passed directly to the RCA Agent as structured context input.
     """
     normalized_log: str
-    error_blocks: list[ErrorBlock]
-    primary_error: ErrorBlock | None
+    workflow_segments: list[dict[str, Any]]   # Step 2: segmented hierarchy
+    error_blocks: list[ErrorBlock]             # Step 3-5: validated failure events
+    primary_error: ErrorBlock | None           # highest rca_weight block
     error_signature: ErrorSignatureResult | None
     embeddings: EmbeddingResult | None
     metadata: dict[str, Any] = field(default_factory=dict)
 
 
 # ---------------------------------------------------------------------------
-# Step 5: Text Embedder
+# Step 9: Text Embedder
 # ---------------------------------------------------------------------------
 
 class TextEmbedder:
     """
     Transformer-based text embedding using sentence-transformers/all-MiniLM-L6-v2.
-
     Produces L2-normalised 384-dimensional vectors for cosine similarity search.
     Falls back to a deterministic zero vector when the library is unavailable.
     """
@@ -1398,7 +1501,7 @@ class TextEmbedder:
             self._ready = True
         except RuntimeError:
             logger.warning(
-                "sentence-transformers unavailable — zero-vector fallback enabled. "
+                "sentence-transformers unavailable -- zero-vector fallback enabled. "
                 "Run: pip install sentence-transformers"
             )
 
@@ -1418,18 +1521,8 @@ class TextEmbedder:
 # ---------------------------------------------------------------------------
 
 class LogParser:
-    """
-    Step 1 — Log Normalization.
+    """Step 1 -- Log Normalization: strip ANSI, timestamps, deduplicate."""
 
-    Actions:
-    • Strip ANSI colour codes and control characters
-    • Normalise timestamps to ISO 8601 (remove leading timestamp prefixes)
-    • Standardise file paths (relative to project root when detectable)
-    • Deduplicate consecutive identical lines
-    • Normalise whitespace and line endings
-    """
-
-    # Re-use the module-level compiled patterns
     def normalize(self, raw_log: str) -> str:
         lines = raw_log.splitlines()
         cleaned: list[str] = []
@@ -1438,7 +1531,7 @@ class LogParser:
             line = clean_line(raw_line)
             if is_noise(line):
                 continue
-            if line == prev:          # deduplicate consecutive identical lines
+            if line == prev:
                 continue
             cleaned.append(line)
             prev = line
@@ -1446,76 +1539,216 @@ class LogParser:
 
 
 # ---------------------------------------------------------------------------
-# Step 2: Error Block Extractor
+# Step 2: Workflow-aware Segmentation
 # ---------------------------------------------------------------------------
 
-_STACK_TRACE_RE = re.compile(
-    r"(?:Traceback|at |^\s+File |^\s+in |Error:|Exception:)", re.M
-)
-_FILE_PATH_RE = re.compile(r'(?:File "?([^",\n]+)"?|in ([^\s\n]+))', re.I)
-_LINE_NUM_RE = re.compile(r"line (\d+)", re.I)
+@dataclass
+class WorkflowSegment:
+    """A named section of the log within the workflow -> job -> step -> command tree."""
+    location: WorkflowLocation
+    start_line: int
+    end_line: int
+    lines: list[tuple[int, str]]          # (log_line_number, cleaned_text)
 
 
-class ErrorBlockExtractor:
+class WorkflowSegmenter:
     """
-    Step 2 — Error Block Extraction.
+    Step 2 -- Workflow-aware Segmentation.
 
-    For each error pattern match:
-    • Capture ±10 lines of surrounding context
-    • Detect and attach complete stack traces
-    • Extract file paths and line numbers
-    • Build a structured ErrorBlock
+    Parses the normalised log and segments it into a hierarchy:
+      workflow -> job -> step -> command
+
+    Markers come from workflow_step_markers in failure_signal_patterns.json.
+    The returned list of WorkflowSegment objects is consumed by FailureEventBuilder
+    to attach precise location context to every failure event.
     """
 
-    CONTEXT_WINDOW = 10
-
-    def extract(self, normalized_log: str) -> list[ErrorBlock]:
+    def segment(
+        self,
+        normalized_log: str,
+        workflow_name: str,
+        job_name: str,
+    ) -> list[WorkflowSegment]:
         lines_raw = normalized_log.splitlines()
-        lines: list[tuple[int, str]] = [
-            (i + 1, line) for i, line in enumerate(lines_raw)
-        ]
+        segments: list[WorkflowSegment] = []
+
+        current_step = ""
+        current_cmd  = ""
+        step_start_idx = 0
+        step_lines: list[tuple[int, str]] = []
+
+        for idx, raw_line in enumerate(lines_raw):
+            line_no = idx + 1
+            line = raw_line
+
+            if _JOB_START_RE and _JOB_START_RE.search(line):
+                job_name = line
+
+            if _STEP_START_RE:
+                m = _STEP_START_RE.match(line)
+                if m:
+                    if step_lines:
+                        segments.append(WorkflowSegment(
+                            location=WorkflowLocation(
+                                workflow=workflow_name, job=job_name,
+                                step=current_step, command=current_cmd,
+                            ),
+                            start_line=step_start_idx + 1,
+                            end_line=line_no - 1,
+                            lines=step_lines,
+                        ))
+                    current_step = m.group("step_name").strip() if "step_name" in m.groupdict() else line
+                    current_cmd  = ""
+                    step_start_idx = idx
+                    step_lines = []
+                    continue
+
+            if _STEP_END_RE and _STEP_END_RE.match(line):
+                if step_lines:
+                    segments.append(WorkflowSegment(
+                        location=WorkflowLocation(
+                            workflow=workflow_name, job=job_name,
+                            step=current_step, command=current_cmd,
+                        ),
+                        start_line=step_start_idx + 1,
+                        end_line=line_no,
+                        lines=step_lines,
+                    ))
+                current_step = ""
+                current_cmd  = ""
+                step_start_idx = idx
+                step_lines = []
+                continue
+
+            if _CMD_RUN_RE and _CMD_RUN_RE.search(line):
+                current_cmd = line
+
+            step_lines.append((line_no, line))
+
+        if step_lines:
+            segments.append(WorkflowSegment(
+                location=WorkflowLocation(
+                    workflow=workflow_name, job=job_name,
+                    step=current_step, command=current_cmd,
+                ),
+                start_line=step_start_idx + 1,
+                end_line=len(lines_raw),
+                lines=step_lines,
+            ))
+
+        return segments
+
+
+# ---------------------------------------------------------------------------
+# Step 3: Failure Event Construction
+# ---------------------------------------------------------------------------
+
+_FILE_PATH_RE = re.compile(r'(?:File "?([^",\n]+)"?|in ([^\s\n]+))', re.I)
+_LINE_NUM_RE  = re.compile(r"line (\d+)", re.I)
+
+
+def _detect_language_from_stack(lines: list[str]) -> str:
+    """Identify the stack-trace language from a list of trace lines."""
+    for lang, pat in _STACK_TRACE_LANG_RES.items():
+        if any(pat.search(l) for l in lines):
+            return lang
+    return ""
+
+
+def _collect_stack_trace(
+    all_lines: list[tuple[int, str]],
+    start_idx: int,
+) -> list[str]:
+    """
+    Collect consecutive stack-trace lines beginning at start_idx.
+    Uses per-language patterns from stack_trace_patterns and caps depth
+    at _MAX_STACK_DEPTH lines (from failure_signal_patterns.json).
+    """
+    stack: list[str] = []
+    generic_re = re.compile(
+        r"(?:Traceback|^\s+at |^\s+File |^\s+in |"
+        r"^\s+from |Caused by:|^\tat [a-zA-Z]|\.\.\. \d+ more)",
+        re.M,
+    )
+    for _, line in all_lines[start_idx: start_idx + _MAX_STACK_DEPTH]:
+        is_frame = generic_re.search(line) or any(
+            pat.search(line) for pat in _STACK_TRACE_LANG_RES.values()
+        )
+        if is_frame:
+            stack.append(line)
+        elif stack and line.strip():
+            stack.append(line)
+            break
+    return stack
+
+
+class FailureEventBuilder:
+    """
+    Step 3 -- Failure Event Construction.
+
+    For each failure-start marker found in a segment's lines:
+    1. Record the start marker name and line.
+    2. Scan forward until a failure-end marker or causal-window limit is reached.
+    3. Collect ALL lines between start and end as context (no fixed +-N window).
+    4. Detect and attach stack traces (language-aware).
+    5. Extract file paths and line numbers from the error line.
+    6. Return one ErrorBlock per distinct failure event, before scoring.
+    """
+
+    def build(
+        self,
+        segments: list[WorkflowSegment],
+        now_ts: str,
+    ) -> list[ErrorBlock]:
         blocks: list[ErrorBlock] = []
         seen_fingerprints: set[str] = set()
-        now_ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
 
-        for idx, (line_number, line) in enumerate(lines):
-            match_payload = first_error_match(line)
-            if not match_payload:
-                continue
+        for segment in segments:
+            seg_lines = segment.lines
+            seg_len   = len(seg_lines)
 
-            pattern_name, match = match_payload
-            fp = fingerprint_error(line)
-            if fp in seen_fingerprints:
-                continue
-            seen_fingerprints.add(fp)
+            for idx, (line_no, line) in enumerate(seg_lines):
+                # --- Match failure start marker (change #8) ---
+                start_name, _start_tier = self._match_start(line)
+                if start_name is None:
+                    continue
 
-            error_type = classify_error(line, pattern_name)
-            error_code = extract_error_code(line, match, error_type)
+                fp = fingerprint_error(line)
+                if fp in seen_fingerprints:
+                    continue
+                seen_fingerprints.add(fp)
 
-            # Context windows
-            before_start = max(0, idx - self.CONTEXT_WINDOW)
-            after_end = min(len(lines), idx + self.CONTEXT_WINDOW + 1)
-            context_before = [l for _, l in lines[before_start:idx]]
-            context_after = [l for _, l in lines[idx + 1: after_end]]
+                # --- Find failure block end (change #8) ---
+                end_idx, end_name = self._find_end(seg_lines, idx, seg_len)
 
-            # Stack trace: collect contiguous lines that look like trace frames
-            stack_trace: list[str] = []
-            for _, tl in lines[idx: min(len(lines), idx + 30)]:
-                if _STACK_TRACE_RE.search(tl):
-                    stack_trace.append(tl)
+                # --- Collect full context (change #9: no fixed window) ---
+                block_lines    = seg_lines[idx: end_idx]
+                context_before = [l for _, l in seg_lines[max(0, idx - 5): idx]]
+                context_after  = [l for _, l in block_lines[1:]]
 
-            # File path and line number extraction
-            file_path = ""
-            ln: int | None = None
-            fp_match = _FILE_PATH_RE.search(line)
-            if fp_match:
-                file_path = (fp_match.group(1) or fp_match.group(2) or "").strip()
-            ln_match = _LINE_NUM_RE.search(line)
-            if ln_match:
-                ln = int(ln_match.group(1))
+                # --- Language-aware stack trace collection ---
+                stack_trace = _collect_stack_trace(seg_lines, idx)
 
-            blocks.append(
-                ErrorBlock(
+                # --- File path / line number ---
+                file_path = ""
+                ln: int | None = None
+                fp_m = _FILE_PATH_RE.search(line)
+                if fp_m:
+                    file_path = (fp_m.group(1) or fp_m.group(2) or "").strip()
+                ln_m = _LINE_NUM_RE.search(line)
+                if ln_m:
+                    ln = int(ln_m.group(1))
+
+                # --- Language-specific error classification (change #7) ---
+                match_payload = first_error_match(line)
+                pattern_name  = match_payload[0] if match_payload else start_name
+                error_type    = classify_error(line, pattern_name)
+                error_code    = (
+                    extract_error_code(line, match_payload[1], error_type)
+                    if match_payload else error_code_for_line(line, None, error_type)
+                )
+
+                blocks.append(ErrorBlock(
                     error_type=error_type,
                     error_message=line,
                     error_code=error_code,
@@ -1523,90 +1756,293 @@ class ErrorBlockExtractor:
                     context_before=context_before,
                     context_after=context_after,
                     file_path=file_path,
-                    line_number=ln or line_number,
+                    line_number=ln or line_no,
                     timestamp=now_ts,
-                )
-            )
+                    location=segment.location,
+                    start_marker=start_name,
+                    end_marker=end_name,
+                    start_line_number=line_no,
+                    end_line_number=seg_lines[end_idx - 1][0] if end_idx > idx else line_no,
+                    rca_weight=0,
+                ))
 
         return blocks
 
+    # ------------------------------------------------------------------
+    def _match_start(self, line: str) -> tuple[str | None, str]:
+        """Return (marker_name, severity_tier) if line matches a start marker."""
+        for name, pat, tier, _is_terminal in _FAILURE_START_MARKERS:
+            if pat.search(line):
+                return name, tier
+        # Fallback: also honour legacy failure_block_patterns
+        for name, pat in FAILURE_BLOCK_PATTERNS:
+            if pat.search(line):
+                return name, "medium"
+        return None, ""
+
+    def _find_end(
+        self,
+        lines: list[tuple[int, str]],
+        start_idx: int,
+        seg_len: int,
+    ) -> tuple[int, str]:
+        """
+        Scan forward from start_idx to find the failure block end.
+        Returns (end_idx, end_marker_name) where end_idx is exclusive.
+        """
+        max_end = min(seg_len, start_idx + _CAUSAL_WINDOW_LINES * 2)
+        for i in range(start_idx + 1, max_end):
+            _, line = lines[i]
+            for name, pat, _terminates_all, _is_cascade in _FAILURE_END_MARKERS:
+                if pat.search(line):
+                    return i, name
+            if FAILURE_BLOCK_END_RE.search(line):
+                return i, "legacy_end"
+            if _STEP_START_RE and _STEP_START_RE.match(line):
+                return i, "step_boundary"
+        return max_end, "causal_window_limit"
+
 
 # ---------------------------------------------------------------------------
-# Step 3: Context Enricher
+# Step 4: Hierarchical Severity Scorer  (change #3)
+# ---------------------------------------------------------------------------
+
+# Severity rank for comparisons
+_SEVERITY_RANK: dict[str, int] = {"critical": 4, "high": 3, "medium": 2, "low": 1}
+
+# Tier -> base score (from taxonomy)
+_TIER_BASE_SCORE: dict[str, int] = {
+    "critical": 100,
+    "high":     75,
+    "medium":   50,
+    "low":      25,
+}
+
+
+def _tier_for_error_type(error_type: str) -> str:
+    """Look up the failure taxonomy tier for a given error type."""
+    for tier_name, tier_data in _TAXONOMY_TIERS.items():
+        if error_type in tier_data.get("error_types", []):
+            return tier_name
+    return "low"
+
+
+def _tier_for_start_marker(start_marker: str) -> str:
+    """Map a failure-start marker name back to its severity_tier."""
+    for name, _pat, tier, _t in _FAILURE_START_MARKERS:
+        if name == start_marker:
+            return tier
+    return "low"
+
+
+class HierarchicalSeverityScorer:
+    """
+    Step 4 -- Hierarchical Severity Scoring.
+
+    Scores are driven by the failure taxonomy tiers defined in
+    failure_taxonomy.tiers rather than flat regex weight constants (change #3).
+
+    Scoring dimensions
+    ------------------
+    Taxonomy tier    : base score from tiers: critical=100, high=75, medium=50, low=25
+    Root-cause type  : taxonomy root_cause_types earn +20
+    Cascading type   : taxonomy cascading_types lose -10
+    Stack trace      : language-aware stack frames present -> +15
+    File path        : error localised to a known file -> +10
+    Error code       : non-generic concrete code -> +10
+    Causal link      : "Caused by:" / "due to" lines in context -> +10
+    Position bonus   : earlier in log -> up to +15 (decreases linearly)
+    """
+
+    _GENERIC_CODES: frozenset[str] = frozenset({
+        "", "UNKNOWN", "UNKNOWN_ERROR", "TEST_FAILURE", "GENERIC_ERROR", "PROCESS_EXIT",
+    })
+
+    def score(
+        self,
+        block: "ErrorBlock",
+        position_index: int,
+        total_blocks: int,
+    ) -> int:
+        # 1. Base: taxonomy tier (prefer marker tier over error-type tier for
+        #    cases where the marker has an explicit tier assignment)
+        marker_tier    = _tier_for_start_marker(block.start_marker)
+        type_tier      = _tier_for_error_type(block.error_type)
+        effective_tier = (
+            marker_tier
+            if _SEVERITY_RANK.get(marker_tier, 0) >= _SEVERITY_RANK.get(type_tier, 0)
+            else type_tier
+        )
+        base_score = _TIER_BASE_SCORE.get(effective_tier, 25)
+        score = base_score // 2
+
+        # 2. Root-cause vs cascading
+        if block.error_type in _ROOT_CAUSE_TYPES_TAXONOMY:
+            score += 20
+        elif block.error_type in _CASCADING_TYPES_TAXONOMY:
+            score -= 10
+
+        # 3. Stack trace (language-aware frames)
+        if block.stack_trace:
+            score += 15
+
+        # 4. File path localisation
+        if block.file_path:
+            score += 10
+
+        # 5. Concrete error code
+        if block.error_code and block.error_code.upper() not in self._GENERIC_CODES:
+            score += 10
+
+        # 6. Causal link in context
+        all_ctx = "\n".join(block.context_before + [block.error_message] + block.context_after)
+        if any(pat.search(all_ctx) for _, pat in _CAUSAL_LINK_PATTERNS):
+            score += 10
+
+        # 7. Position bonus (earlier = higher)
+        if total_blocks > 1:
+            score += round(15 * (1 - position_index / (total_blocks - 1)))
+        else:
+            score += 15
+
+        return max(0, min(100, score))
+
+    def classify_severity(self, block: "ErrorBlock") -> str:
+        """Return the severity label from the taxonomy for this block's error type."""
+        tier = _tier_for_error_type(block.error_type)
+        if tier == "low" and block.start_marker:
+            tier = _tier_for_start_marker(block.start_marker)
+        # Also respect legacy signal-based classification; take the higher
+        sig_severity = classify_severity(block.error_message, block.error_type, block.error_code)
+        if _SEVERITY_RANK.get(sig_severity, 0) > _SEVERITY_RANK.get(tier, 0):
+            return sig_severity
+        return tier
+
+
+# ---------------------------------------------------------------------------
+# Step 5: Root-cause Validator  (change #5)
+# ---------------------------------------------------------------------------
+
+class RootCauseValidator:
+    """
+    Step 5 -- Root-cause Validation.
+
+    Filters out ErrorBlock objects that are terminal-status noise rather than
+    actionable root causes.  A block is marked as terminal noise when:
+    - Its error_type is in the taxonomy's terminal_noise_types, OR
+    - Its start_marker has is_terminal=True in failure_block_start_markers, OR
+    - The error_message matches any terminal_noise_patterns entry.
+
+    Blocks flagged is_terminal_noise=True are excluded so the RCA model never
+    sees cascade wrappers (exit codes, "job failed", etc.) as the primary error.
+    """
+
+    def validate(self, blocks: list[ErrorBlock]) -> list[ErrorBlock]:
+        """Return only non-terminal-noise blocks, flagging each block."""
+        from dataclasses import replace as _dc_replace
+        flagged: list[ErrorBlock] = []
+        for blk in blocks:
+            is_noise_flag = self._is_terminal_noise(blk)
+            flagged.append(_dc_replace(blk, is_terminal_noise=is_noise_flag))
+
+        kept = [b for b in flagged if not b.is_terminal_noise]
+        return kept if kept else flagged[:1]
+
+    def _is_terminal_noise(self, block: ErrorBlock) -> bool:
+        if block.error_type in _TERMINAL_NOISE_TYPES:
+            return True
+        for name, _pat, _tier, is_terminal in _FAILURE_START_MARKERS:
+            if name == block.start_marker and is_terminal:
+                return True
+        for pat in _TERMINAL_NOISE_PATTERNS:
+            if pat.search(block.error_message):
+                return True
+        return False
+
+
+# ---------------------------------------------------------------------------
+# Step 6: Context Enricher  (change #6 – adapted for new ErrorBlock shape)
 # ---------------------------------------------------------------------------
 
 class ContextEnricher:
     """
-    Step 3 — Context Enrichment.
+    Step 6 -- Context Enrichment.
 
-    Integrates CI/repository metadata into each ErrorBlock and computes
-    error severity and impact scope.
+    Integrates CI/repository metadata into each ErrorBlock, detects language
+    from stack traces, and computes severity/impact using the taxonomy scorer.
     """
 
     _IMPACT_MAP: dict[str, str] = {
-        "build_error": "build",
-        "dependency_error": "build",
-        "test_failure": "test",
+        "build_error":         "build",
+        "dependency_error":    "build",
+        "java_exception":      "build",
+        "python_exception":    "build",
+        "shell_error":         "build",
+        "test_failure":        "test",
         "configuration_error": "deployment",
-        "kubernetes_error": "deployment",
-        "container_error": "deployment",
-        "permission_error": "deployment",
-        "timeout": "deployment",
-        "network_error": "deployment",
-        "resource_error": "deployment",
+        "kubernetes_error":    "deployment",
+        "container_error":     "deployment",
+        "permission_error":    "deployment",
+        "timeout":             "deployment",
+        "network_error":       "deployment",
+        "resource_error":      "deployment",
+        "javascript_error":    "test",
+        "typescript_error":    "build",
+        "ruby_error":          "test",
     }
+
+    def __init__(self) -> None:
+        self._scorer = HierarchicalSeverityScorer()
 
     def enrich(
         self,
         error_blocks: list[ErrorBlock],
-        normalized_log: str,
         metadata: dict[str, Any],
     ) -> list[ErrorBlock]:
+        from dataclasses import replace as _dc_replace
         enriched: list[ErrorBlock] = []
         env = metadata.get("environment", {})
         for block in error_blocks:
-            severity = classify_severity(block.error_message, block.error_type, block.error_code)
-            if severity == "low" and block.error_type in {
-                "permission_error", "network_error", "timeout", "resource_error"
-            }:
-                severity = "medium"
-            block = ErrorBlock(
-                error_type=block.error_type,
-                error_message=block.error_message,
-                error_code=block.error_code,
-                stack_trace=block.stack_trace,
-                context_before=block.context_before,
-                context_after=block.context_after,
-                file_path=block.file_path,
-                line_number=block.line_number,
-                timestamp=block.timestamp,
+            severity     = self._scorer.classify_severity(block)
+            new_weight   = self._scorer.score(block, 0, 1)
+            final_weight = max(block.rca_weight, new_weight)
+
+            existing_env = dict(block.ci_environment)
+            existing_env.update({
+                "os":       env.get("os", ""),
+                "runner":   env.get("runner", ""),
+                "workflow": metadata.get("workflow_name", ""),
+                "job":      metadata.get("job_name", ""),
+            })
+
+            block = _dc_replace(
+                block,
                 repository=metadata.get("repository", ""),
-                language=env.get("language", ""),
+                language=env.get("language", "") or _detect_language_from_stack(block.stack_trace),
                 framework=env.get("framework", ""),
-                ci_environment={
-                    "os": env.get("os", ""),
-                    "runner": env.get("runner", ""),
-                    "workflow": metadata.get("workflow_name", ""),
-                    "job": metadata.get("job_name", ""),
-                },
+                ci_environment=existing_env,
                 dependencies=metadata.get("dependencies", []),
                 severity=severity,
                 impact_scope=self._IMPACT_MAP.get(block.error_type, "unknown"),
+                rca_weight=final_weight,
             )
             enriched.append(block)
+
+        enriched.sort(key=lambda b: b.rca_weight, reverse=True)
         return enriched
 
 
 # ---------------------------------------------------------------------------
-# Step 4: Error Signature Generator
+# Step 7: Error Signature Generator
 # ---------------------------------------------------------------------------
 
 class ErrorSignatureGenerator:
     """
-    Step 4 — Error Signature Generation.
+    Step 7 -- Error Signature Generation.
 
     Produces a deterministic SHA-256 hash and human-readable label for each
-    primary error block. Used as the key in the self-learning KB.
+    primary error block.  Used as the key in the self-learning KB.
+    Signature now includes workflow/job/step location components.
     """
 
     _VARIABLE_RE = re.compile(
@@ -1620,7 +2056,6 @@ class ErrorSignatureGenerator:
         raw = f"{block.error_type}|{normalised_msg}|{normalised_loc}"
         sig_hash = hashlib.sha256(raw.encode("utf-8")).hexdigest()
 
-        # Build human-readable label: type_keyword1_keyword2
         key_tokens = [
             t for t in re.split(r"[^a-z0-9]+", normalised_msg.lower())
             if len(t) > 3 and not t.isdigit()
@@ -1631,15 +2066,111 @@ class ErrorSignatureGenerator:
             hash=sig_hash,
             readable=readable,
             components={
-                "error_type": block.error_type,
+                "error_type":     block.error_type,
                 "error_location": block.file_path or "",
-                "error_pattern": normalised_msg[:120],
+                "error_pattern":  normalised_msg[:120],
+                "workflow":       block.location.workflow,
+                "job":            block.location.job,
+                "step":           block.location.step,
             },
         )
 
     def _normalise(self, text: str) -> str:
         text = self._VARIABLE_RE.sub("<var>", text)
         return re.sub(r"\s+", " ", text).strip().lower()
+
+
+# ---------------------------------------------------------------------------
+# Compatibility shim: score_error_block for the batch extract_failure_blocks path
+# ---------------------------------------------------------------------------
+
+def score_error_block(
+    error_type: str,
+    error_code: str,
+    severity: str,
+    stack_trace: list[str],
+    file_path: str,
+    position_index: int,
+    total_blocks: int,
+) -> int:
+    """
+    Thin compatibility wrapper: delegates to HierarchicalSeverityScorer.
+    Used by the batch extract_failure_blocks / legacy call-sites.
+    """
+    _scorer = HierarchicalSeverityScorer()
+    from dataclasses import replace as _dc_replace
+    dummy = ErrorBlock(
+        error_type=error_type,
+        error_message="",
+        error_code=error_code,
+        stack_trace=stack_trace,
+        context_before=[],
+        context_after=[],
+        file_path=file_path,
+        line_number=None,
+        timestamp="",
+        severity=severity,
+        rca_weight=0,
+    )
+    return _scorer.score(dummy, position_index, total_blocks)
+
+
+# ---------------------------------------------------------------------------
+# Step 8: Semantic Deduplication  (change #4)
+# ---------------------------------------------------------------------------
+
+class SemanticDeduplicator:
+    """
+    Step 8 -- Semantic Deduplication against ChromaDB knowledge base.
+
+    Before a new failure event reaches the RCA model, this step queries the
+    ChromaDB vector store to check for semantically near-identical errors.
+    Blocks whose cosine similarity to an existing KB entry exceeds
+    _SEMANTIC_SIM_THRESHOLD (from failure_signal_patterns.json, default 0.85)
+    are flagged _kb_duplicate=True in ci_environment so downstream consumers
+    can skip full RCA and reuse cached results.
+
+    If no vector_db is provided, deduplication is a no-op.
+    """
+
+    def __init__(self, vector_db: Any | None = None) -> None:
+        self._db = vector_db
+        self._embedder = TextEmbedder()
+
+    def deduplicate(
+        self,
+        blocks: list[ErrorBlock],
+        collection: str = "ci_failure_logs",
+    ) -> list[ErrorBlock]:
+        if not self._db:
+            return blocks
+
+        from dataclasses import replace as _dc_replace
+        deduped: list[ErrorBlock] = []
+        for blk in blocks:
+            query_text = blk.error_message
+            if blk.stack_trace:
+                query_text = "\n".join([blk.error_message] + blk.stack_trace[:5])
+            try:
+                results = self._db.search(
+                    query=query_text,
+                    n_results=1,
+                    collection=collection,
+                )
+            except Exception:  # noqa: BLE001
+                deduped.append(blk)
+                continue
+
+            is_dup = False
+            if results:
+                top_score = results[0].score if hasattr(results[0], "score") else 0.0
+                is_dup = float(top_score) >= _SEMANTIC_SIM_THRESHOLD
+
+            env = dict(blk.ci_environment)
+            env["_kb_duplicate"] = is_dup
+            deduped.append(_dc_replace(blk, ci_environment=env))
+
+        return deduped
 
 
 # ---------------------------------------------------------------------------
@@ -1650,38 +2181,39 @@ class PreprocessingPipeline:
     """
     Real-time preprocessing pipeline for CI failure logs.
 
-    Orchestrates all five steps defined in REVISED_ARCHITECTURE_PLAN.md §2:
+    Orchestrates the redesigned nine-step pipeline:
 
-    Step 1: Log Normalization    → clean, deduplicated log text
-    Step 2: Error Block Extract  → list[ErrorBlock] with context windows
-    Step 3: Context Enrichment   → attach CI/repo metadata + severity
-    Step 4: Error Signature      → deterministic SHA-256 + readable label
-    Step 5: Vector Embedding     → 384-dim L2-normalised embeddings
+    Step 1: Log Normalization          -> clean, deduplicated log text
+    Step 2: Workflow-aware Segmentation -> workflow -> job -> step -> command tree (change #1)
+    Step 3: Failure Event Construction  -> FailureEventBuilder groups error lines,
+                                           stack traces, and metadata using start/end
+                                           markers (change #8); context = full block (change #9)
+    Step 4: Hierarchical Severity Score -> HierarchicalSeverityScorer using taxonomy
+                                           tiers (change #3)
+    Step 5: Root-cause Validation       -> RootCauseValidator filters terminal noise (change #5)
+    Step 6: Context Enrichment          -> CI/repo metadata, language detection
+    Step 7: Error Signature             -> deterministic SHA-256 + readable label
+    Step 8: Semantic Deduplication      -> ChromaDB KB similarity check (change #4)
+    Step 9: Vector Embedding            -> 384-dim L2-normalised embeddings
 
-    Returns a ProcessedLog ready to be consumed by the RCA Agent.
-
-    RCA Agent input contract (vectorized context for model)
-    ────────────────────────────────────────────────────────
-    {
-        "vectorized_error":   EmbeddingResult.error_embedding   (384-dim float list)
-        "vectorized_context": EmbeddingResult.context_embedding (384-dim float list)
-        "error_signature":    ErrorSignatureResult.readable     (string key for KB)
-        "error_blocks":       [EnrichedErrorBlock, ...]         (structured dicts)
-        "metadata":           dict                              (CI/run context)
-    }
+    Returns a ProcessedLog ready for the RCA Agent.
     """
 
     def __init__(
         self,
         embedding_model: str = "sentence-transformers/all-MiniLM-L6-v2",
-        context_window: int = 10,
+        context_window: int = 10,     # kept for API compatibility; not used as fixed window
+        vector_db: Any | None = None,
     ) -> None:
-        self.log_parser = LogParser()
-        self.error_extractor = ErrorBlockExtractor()
-        self.context_enricher = ContextEnricher()
-        self.signature_generator = ErrorSignatureGenerator()
-        self.embedder = TextEmbedder(model=embedding_model)
-        self._context_window = context_window
+        self.log_parser           = LogParser()
+        self.segmenter            = WorkflowSegmenter()
+        self.event_builder        = FailureEventBuilder()
+        self.severity_scorer      = HierarchicalSeverityScorer()
+        self.root_cause_validator = RootCauseValidator()
+        self.context_enricher     = ContextEnricher()
+        self.signature_generator  = ErrorSignatureGenerator()
+        self.deduplicator         = SemanticDeduplicator(vector_db=vector_db)
+        self.embedder             = TextEmbedder(model=embedding_model)
 
     # ------------------------------------------------------------------
     def process(self, raw_log: str, metadata: dict[str, Any]) -> ProcessedLog:
@@ -1691,36 +2223,69 @@ class PreprocessingPipeline:
         Parameters
         ----------
         raw_log : str
-            Raw text from a GitHub Actions log file (may contain ANSI codes,
-            timestamps, control characters, etc.)
+            Raw text from a GitHub Actions log file.
         metadata : dict
-            Run/job metadata dict — should contain at minimum:
-            repository, run_id, workflow_name, job_name, branch, commit_sha.
-            Optionally an 'environment' sub-dict with os/runner/language/framework.
-
-        Returns
-        -------
-        ProcessedLog
-            Fully enriched log object ready for KB search and RCA generation.
+            Run/job metadata: repository, run_id, workflow_name, job_name,
+            branch, commit_sha.  Optionally an 'environment' sub-dict with
+            os/runner/language/framework.
         """
-        # Step 1 – Log Normalization
+        from datetime import datetime, timezone
+        now_ts = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+        # Step 1 -- Log Normalization
         normalized = self.log_parser.normalize(raw_log)
 
-        # Step 2 – Error Block Extraction
-        raw_blocks = self.error_extractor.extract(normalized)
+        # Step 2 -- Workflow-aware Segmentation
+        segments = self.segmenter.segment(
+            normalized,
+            workflow_name=metadata.get("workflow_name", ""),
+            job_name=metadata.get("job_name", ""),
+        )
+        segment_dicts = [
+            {
+                "workflow":   s.location.workflow,
+                "job":        s.location.job,
+                "step":       s.location.step,
+                "command":    s.location.command,
+                "start_line": s.start_line,
+                "end_line":   s.end_line,
+                "line_count": len(s.lines),
+            }
+            for s in segments
+        ]
 
-        # Step 3 – Context Enrichment
-        enriched_blocks = self.context_enricher.enrich(raw_blocks, normalized, metadata)
+        # Step 3 -- Failure Event Construction
+        raw_blocks = self.event_builder.build(segments, now_ts)
 
-        # Step 4 – Error Signature Generation
+        # Step 4 -- Hierarchical Severity Scoring
+        total = len(raw_blocks)
+        from dataclasses import replace as _dc_replace
+        scored_blocks: list[ErrorBlock] = []
+        for pos, blk in enumerate(raw_blocks):
+            weight = self.severity_scorer.score(blk, pos, total)
+            scored_blocks.append(_dc_replace(blk, rca_weight=weight))
+
+        # Step 5 -- Root-cause Validation
+        validated_blocks = self.root_cause_validator.validate(scored_blocks)
+
+        # Step 6 -- Context Enrichment
+        enriched_blocks = self.context_enricher.enrich(validated_blocks, metadata)
+
+        # Step 7 -- Error Signature Generation
         primary_error = self._identify_primary(enriched_blocks)
-        error_signature = self.signature_generator.generate(primary_error) if primary_error else None
+        error_signature = (
+            self.signature_generator.generate(primary_error) if primary_error else None
+        )
 
-        # Step 5 – Vector Embedding
-        embeddings = self._generate_embeddings(primary_error, normalized) if primary_error else None
+        # Step 8 -- Semantic Deduplication
+        enriched_blocks = self.deduplicator.deduplicate(enriched_blocks)
+
+        # Step 9 -- Vector Embedding
+        embeddings = self._generate_embeddings(primary_error) if primary_error else None
 
         return ProcessedLog(
             normalized_log=normalized,
+            workflow_segments=segment_dicts,
             error_blocks=enriched_blocks,
             primary_error=primary_error,
             error_signature=error_signature,
@@ -1735,21 +2300,16 @@ class PreprocessingPipeline:
         metadata: dict[str, Any],
     ) -> dict[str, Any]:
         """
-        Convenience method: process a log and return the structured RCA input dict.
+        Process a log and return the structured RCA input dict for the RCA Agent.
 
-        The returned dict contains all fields expected by the RCA Agent:
-        • vectorized_error        — embedding of the primary error message
-        • vectorized_context      — embedding of the full normalized log excerpt
-        • vectorized_combined     — combined error+context embedding
-        • error_signature         — human-readable error signature string
-        • error_signature_hash    — SHA-256 hash of the error signature
-        • error_blocks            — list of enriched error block dicts
-        • primary_error           — most significant error block dict
-        • metadata                — enriched run/CI metadata
-        • model_tuning_params     — default generation hyperparameters
-
-        Model tuning parameters (Qwen-2.5-13B-Instruct defaults):
-          temperature=0.1, top_p=0.9, max_new_tokens=1024, repetition_penalty=1.1
+        Keys returned:
+          vectorized_error/context/combined  -- 384-dim L2-normalised embeddings
+          error_signature / hash / components
+          error_blocks    -- list sorted by rca_weight descending (root cause first)
+          primary_error   -- highest-weight block with full block context and location
+          workflow_segments -- workflow hierarchy context
+          metadata        -- CI/run context
+          model_tuning_params -- Ollama generation parameters
         """
         processed = self.process(raw_log, metadata)
 
@@ -1757,57 +2317,88 @@ class PreprocessingPipeline:
         if processed.primary_error:
             pb = processed.primary_error
             primary_dict = {
-                "error_type": pb.error_type,
-                "error_message": pb.error_message,
-                "error_code": pb.error_code,
-                "stack_trace": pb.stack_trace,
-                "context_before": pb.context_before,
-                "context_after": pb.context_after,
-                "file_path": pb.file_path,
-                "line_number": pb.line_number,
-                "severity": pb.severity,
-                "impact_scope": pb.impact_scope,
-                "repository": pb.repository,
-                "language": pb.language,
-                "framework": pb.framework,
-                "ci_environment": pb.ci_environment,
+                "error_type":       pb.error_type,
+                "error_message":    pb.error_message,
+                "error_code":       pb.error_code,
+                "stack_trace":      pb.stack_trace,
+                # Full failure-block context (change #9: start-to-end, no truncation)
+                "context_before":   pb.context_before,
+                "context_after":    pb.context_after,
+                "file_path":        pb.file_path,
+                "line_number":      pb.line_number,
+                "severity":         pb.severity,
+                "impact_scope":     pb.impact_scope,
+                "repository":       pb.repository,
+                "language":         pb.language,
+                "framework":        pb.framework,
+                "ci_environment":   pb.ci_environment,
+                "rca_weight":       pb.rca_weight,
+                # Workflow location (change #1)
+                "workflow_location": {
+                    "workflow": pb.location.workflow,
+                    "job":      pb.location.job,
+                    "step":     pb.location.step,
+                    "command":  pb.location.command,
+                },
+                # Failure block boundaries (change #8)
+                "start_marker":       pb.start_marker,
+                "end_marker":         pb.end_marker,
+                "start_line_number":  pb.start_line_number,
+                "end_line_number":    pb.end_line_number,
+                "is_terminal_noise":  pb.is_terminal_noise,
             }
 
         error_blocks_list = [
             {
-                "error_type": b.error_type,
-                "error_message": b.error_message,
-                "error_code": b.error_code,
-                "severity": b.severity,
-                "impact_scope": b.impact_scope,
-                "file_path": b.file_path,
-                "line_number": b.line_number,
-                "context_before": b.context_before[:5],
-                "context_after": b.context_after[:5],
+                "error_type":        b.error_type,
+                "error_message":     b.error_message,
+                "error_code":        b.error_code,
+                "severity":          b.severity,
+                "impact_scope":      b.impact_scope,
+                "file_path":         b.file_path,
+                "line_number":       b.line_number,
+                "rca_weight":        b.rca_weight,
+                "context_before":    b.context_before,
+                "context_after":     b.context_after,
+                "stack_trace":       b.stack_trace,
+                "start_marker":      b.start_marker,
+                "end_marker":        b.end_marker,
+                "is_terminal_noise": b.is_terminal_noise,
+                "workflow_location": {
+                    "workflow": b.location.workflow,
+                    "job":      b.location.job,
+                    "step":     b.location.step,
+                    "command":  b.location.command,
+                },
             }
-            for b in (processed.error_blocks or [])
+            for b in sorted(
+                processed.error_blocks or [],
+                key=lambda b: b.rca_weight,
+                reverse=True,
+            )
         ]
 
         sig = processed.error_signature
         emb = processed.embeddings
 
         return {
-            "vectorized_error": emb.error_embedding if emb else [],
-            "vectorized_context": emb.context_embedding if emb else [],
-            "vectorized_combined": emb.combined_embedding if emb else [],
-            "error_signature": sig.readable if sig else "",
-            "error_signature_hash": sig.hash if sig else "",
-            "error_signature_components": sig.components if sig else {},
-            "error_blocks": error_blocks_list,
-            "primary_error": primary_dict,
-            "metadata": metadata,
-            "model_tuning_params": {
-                "temperature": 0.1,
-                "top_p": 0.9,
-                "max_new_tokens": 1024,
-                "repetition_penalty": 1.1,
-                "do_sample": False,
-            },
+            "vectorized_error":           emb.error_embedding    if emb else [],
+            "vectorized_context":         emb.context_embedding  if emb else [],
+            "vectorized_combined":        emb.combined_embedding if emb else [],
+            "error_signature":            sig.readable    if sig else "",
+            "error_signature_hash":       sig.hash        if sig else "",
+            "error_signature_components": sig.components  if sig else {},
+            "error_blocks":        error_blocks_list,
+            "primary_error":       primary_dict,
+            "workflow_segments":   processed.workflow_segments,
+            "metadata":            metadata,
+            # "model_tuning_params": {
+            #     "num_predict":    1024,
+            #     "temperature":    0.1,
+            #     "top_p":          0.85,
+            #     "top_k":          40,
+            #     "repeat_penalty": 1.1,
+            # },
         }
 
     # ------------------------------------------------------------------
@@ -1815,30 +2406,23 @@ class PreprocessingPipeline:
     # ------------------------------------------------------------------
 
     def _identify_primary(self, blocks: list[ErrorBlock]) -> ErrorBlock | None:
-        """Return the highest-severity / most specific error block."""
+        """Return the highest rca_weight non-terminal-noise block."""
         if not blocks:
             return None
-        severity_rank = {"high": 3, "critical": 4, "medium": 2, "low": 1}
-        return max(
-            blocks,
-            key=lambda b: (
-                severity_rank.get(b.severity, 0),
-                b.error_type not in {"unknown_error", "process_exit"},
-                bool(b.stack_trace),
-                bool(b.file_path),
-            ),
-        )
+        candidates = [b for b in blocks if not b.is_terminal_noise] or blocks
+        return max(candidates, key=lambda b: b.rca_weight)
 
-    def _generate_embeddings(
-        self,
-        primary_error: ErrorBlock,
-        normalized_log: str,
-    ) -> EmbeddingResult:
+    def _generate_embeddings(self, primary_error: ErrorBlock) -> EmbeddingResult:
         """Generate three 384-dim embeddings (error / context / combined)."""
         error_text = primary_error.error_message
+        # Full failure-block context (change #9: no truncation)
         context_text = "\n".join(
-            primary_error.context_before + [primary_error.error_message] + primary_error.context_after
+            primary_error.context_before
+            + [primary_error.error_message]
+            + primary_error.context_after
         )
+        if primary_error.stack_trace:
+            context_text = "\n".join(primary_error.stack_trace) + "\n" + context_text
         combined_text = f"{error_text} {context_text}"
 
         vecs = self.embedder.embed_batch([error_text, context_text, combined_text])
@@ -1850,9 +2434,46 @@ class PreprocessingPipeline:
 
 
 # ---------------------------------------------------------------------------
-# datetime import needed by ErrorBlockExtractor
+# datetime import (needed by PreprocessingPipeline.process)
 # ---------------------------------------------------------------------------
-from datetime import datetime, timezone  # noqa: E402 (placed here to avoid circular at top)
+from datetime import datetime, timezone  # noqa: E402
+
+
+# ---------------------------------------------------------------------------
+# Backward-compat: ErrorBlockExtractor shim for the batch extract_signals path
+# ---------------------------------------------------------------------------
+
+_STACK_TRACE_RE = re.compile(
+    r"(?:Traceback|at |^\s+File |^\s+in |Error:|Exception:)", re.M
+)
+
+
+class ErrorBlockExtractor:
+    """
+    Backward-compatible extractor used by the batch extract_signals path.
+
+    The real-time pipeline (PreprocessingPipeline) uses FailureEventBuilder.
+    This class bridges legacy call-sites without breaking them.
+    """
+
+    def __init__(self, context_window: int = 10) -> None:
+        self._builder   = FailureEventBuilder()
+        self._segmenter = WorkflowSegmenter()
+        self._scorer    = HierarchicalSeverityScorer()
+
+    def extract(self, normalized_log: str) -> list[ErrorBlock]:
+        from datetime import datetime, timezone
+        from dataclasses import replace as _dc_replace
+        now_ts     = datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+        segments   = self._segmenter.segment(normalized_log, "", "")
+        raw_blocks = self._builder.build(segments, now_ts)
+        total      = len(raw_blocks)
+        scored: list[ErrorBlock] = []
+        for pos, blk in enumerate(raw_blocks):
+            weight = self._scorer.score(blk, pos, total)
+            scored.append(_dc_replace(blk, rca_weight=weight))
+        scored.sort(key=lambda b: b.rca_weight, reverse=True)
+        return scored
 
 
 def parse_args() -> argparse.Namespace:

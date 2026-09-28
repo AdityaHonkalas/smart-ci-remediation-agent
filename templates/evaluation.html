@@ -1,0 +1,334 @@
+{% extends "base.html" %}
+{% block title %}Evaluation Metrics — Smart CI Remediation{% endblock %}
+
+{% block content %}
+<main class="report-main">
+
+  <div class="report-header">
+    <h1>Evaluation Metrics</h1>
+    <p>Tool performance indicators — Precision, Recall, F1, Accuracy, and confidence calibration.</p>
+  </div>
+
+  <!-- Methodology Note -->
+  <details class="methodology-box">
+    <summary>Methodology &amp; Evaluation Approach</summary>
+    <p id="methodology-text">Loading methodology note…</p>
+    <p style="margin-top:8px; font-size:12px; color:var(--muted);" id="methodology-source"></p>
+  </details>
+
+  <!-- KPI Tiles — Primary metrics (archive-derived) -->
+  <div class="kpi-grid">
+    <div class="kpi-tile">
+      <div class="kpi-value" id="kpi-precision">—</div>
+      <div class="kpi-label">Precision</div>
+      <div class="kpi-sub" id="kpi-precision-src">Applicable fixes / total candidates</div>
+    </div>
+    <div class="kpi-tile">
+      <div class="kpi-value" id="kpi-recall">—</div>
+      <div class="kpi-label">Recall</div>
+      <div class="kpi-sub" id="kpi-recall-src">Archive runs / KB entry count</div>
+    </div>
+    <div class="kpi-tile">
+      <div class="kpi-value" id="kpi-f1">—</div>
+      <div class="kpi-label">F1-Score</div>
+      <div class="kpi-sub" id="kpi-f1-src">Harmonic mean of P &amp; R</div>
+    </div>
+    <div class="kpi-tile">
+      <div class="kpi-value" id="kpi-accuracy">—</div>
+      <div class="kpi-label">Accuracy</div>
+      <div class="kpi-sub" id="kpi-accuracy-src">Aggregate fix applicability rate</div>
+    </div>
+    <div class="kpi-tile">
+      <div class="kpi-value" id="kpi-ec-accuracy">—</div>
+      <div class="kpi-label">Error Classif. Accuracy</div>
+      <div class="kpi-sub">KB RCAs with confidence &ge; 70% <span class="badge-src">(ChromaDB KB)</span></div>
+    </div>
+    <div class="kpi-tile">
+      <div class="kpi-value" id="kpi-rca-count">—</div>
+      <div class="kpi-label">Total Diagnoses</div>
+      <div class="kpi-sub" id="kpi-rca-src">RCA runs stored in KB</div>
+    </div>
+  </div>
+
+  <!-- Chart Grid — existing evaluation charts -->
+  <div class="chart-grid">
+
+    <div class="chart-card">
+      <h3>Confidence Calibration Curve</h3>
+      <p class="chart-subtitle">Predicted confidence vs actual fix success rate per confidence bucket</p>
+      <canvas id="chart-calibration"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Precision–Recall Curve</h3>
+      <p class="chart-subtitle">Trade-off across confidence thresholds (sweep from 0 &rarr; 1)</p>
+      <canvas id="chart-pr-curve"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Performance by Error Type</h3>
+      <p class="chart-subtitle">Per-category Precision / Recall / F1 across archive diagnosis runs</p>
+      <canvas id="chart-perf-by-type"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>KB Hit Rate Trend</h3>
+      <p class="chart-subtitle">Daily % of RCAs sourced from KB vs LLM model over time</p>
+      <canvas id="chart-kb-trend"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Fix Acceptance Rate by Fix Type</h3>
+      <p class="chart-subtitle">% of applied fixes marked successful per fix category (archive-seeded)</p>
+      <canvas id="chart-fix-acceptance"></canvas>
+    </div>
+
+  </div><!-- /.chart-grid -->
+
+  <!-- ── RCA + Fix Generation Success ─────────────────────────────── -->
+  <div class="report-header" style="margin-top:36px; border-top:1px solid var(--border); padding-top:20px;">
+    <h2 style="font-size:18px;">RCA + Fix Generation Success</h2>
+    <p>Composite performance across <span id="archive-count-label">—</span> batch diagnosis runs
+       from the staging archive — combining diagnostic confidence with fix applicability.</p>
+  </div>
+
+  <div class="kpi-grid">
+    <div class="kpi-tile">
+      <div class="kpi-value" id="kpi-total-rca">—</div>
+      <div class="kpi-label">Batch Diagnoses</div>
+      <div class="kpi-sub">Total archive runs <span class="badge-src">(Archive)</span></div>
+    </div>
+    <div class="kpi-tile">
+      <div class="kpi-value" id="kpi-high-conf-rate">—</div>
+      <div class="kpi-label">High-Confidence Rate</div>
+      <div class="kpi-sub">Runs with score &ge; 70% <span class="badge-src">(Archive)</span></div>
+    </div>
+    <div class="kpi-tile">
+      <div class="kpi-value" id="kpi-composite-success">—</div>
+      <div class="kpi-label">Composite Success Rate</div>
+      <div class="kpi-sub">High-conf &amp; applicable fix <span class="badge-src">(Archive)</span></div>
+    </div>
+  </div>
+
+  <div class="chart-grid" style="margin-top:16px;">
+    <div class="chart-card">
+      <h3>High-Confidence &amp; Composite Success by Error Type</h3>
+      <p class="chart-subtitle">Per-error-type breakdown of high-confidence rate vs composite success rate</p>
+      <canvas id="chart-rca-fix-by-type"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Confidence Score vs Fix Applicability</h3>
+      <p class="chart-subtitle">Scatter: each point is one archive diagnosis run. Hover to see error type.</p>
+      <canvas id="chart-conf-vs-applicability"></canvas>
+    </div>
+
+    <div class="chart-card">
+      <h3>Average Confidence Factors</h3>
+      <p class="chart-subtitle">Mean score of each RCA confidence factor across all archive runs</p>
+      <canvas id="chart-conf-factors"></canvas>
+    </div>
+  </div>
+
+  <!-- ── Human Feedback Validation ──────────────────────────────────── -->
+  <div class="report-header" style="margin-top:32px; border-top:1px solid var(--border); padding-top:20px;">
+    <h2 style="font-size:18px;">Human Feedback Validation</h2>
+    <p>Structured expert judgements collected via the &#x270E; Validate Fix form on each fix recommendation.</p>
+  </div>
+
+  <div class="kpi-grid" id="hf-kpi-grid">
+    <div class="kpi-tile">
+      <div class="kpi-value" id="kpi-hf-count">—</div>
+      <div class="kpi-label">Total Feedback</div>
+      <div class="kpi-sub">User validation submissions <span class="badge-src">(User feedback)</span></div>
+    </div>
+    <div class="kpi-tile">
+      <div class="kpi-value" id="kpi-hf-accept">—</div>
+      <div class="kpi-label">Acceptance Rate</div>
+      <div class="kpi-sub">Fix correct (yes + partially)</div>
+    </div>
+    <div class="kpi-tile">
+      <div class="kpi-value" id="kpi-hf-rating">—</div>
+      <div class="kpi-label">Avg Rating</div>
+      <div class="kpi-sub">Out of 5 stars</div>
+    </div>
+    <div class="kpi-tile">
+      <div class="kpi-value" id="kpi-hf-rcc">—</div>
+      <div class="kpi-label">Root Cause Correct</div>
+      <div class="kpi-sub">Yes + partially rate</div>
+    </div>
+    <div class="kpi-tile">
+      <div class="kpi-value" id="kpi-hf-resolved">—</div>
+      <div class="kpi-label">Issue Resolved</div>
+      <div class="kpi-sub">Fully resolved rate</div>
+    </div>
+  </div>
+
+  <div class="chart-grid" style="margin-top:16px;">
+    <div class="chart-card">
+      <h3>Fix Acceptance by Rating</h3>
+      <p class="chart-subtitle">Number of feedback submissions per star rating (1–5)</p>
+      <canvas id="chart-hf-rating"></canvas>
+    </div>
+    <div class="chart-card">
+      <h3>Fix Correctness Distribution</h3>
+      <p class="chart-subtitle">Proportion of Yes / Partially / No responses for Fix Correct</p>
+      <canvas id="chart-hf-correctness"></canvas>
+    </div>
+  </div>
+
+  <p id="data-note" style="margin-top:16px; font-size:12px; color:var(--muted); font-style:italic;"></p>
+
+</main>
+
+<style>
+.badge-src {
+  display: inline-block;
+  font-size: 10px;
+  font-weight: 600;
+  color: var(--muted);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: 3px;
+  padding: 0 4px;
+  margin-left: 3px;
+  vertical-align: middle;
+}
+</style>
+
+<script src="{{ url_for('static', filename='js/charts.js') }}"></script>
+<script>
+(async function () {
+  let data;
+  try {
+    const resp = await fetch('/api/evaluation/metrics');
+    if (!resp.ok) throw new Error('API returned ' + resp.status);
+    data = await resp.json();
+  } catch (err) {
+    document.getElementById('data-note').textContent =
+      'Failed to load evaluation data: ' + err.message;
+    return;
+  }
+
+  // Methodology note
+  if (data.methodology_note) {
+    document.getElementById('methodology-text').textContent = data.methodology_note;
+  }
+  if (data.data_source) {
+    document.getElementById('methodology-source').textContent =
+      'Data source: ' + data.data_source;
+  }
+
+  // Helpers
+  function pct(v) {
+    if (v == null) return 'N/A';
+    return (v * 100).toFixed(1) + '%';
+  }
+  function srcBadge(label) { return label ? ` (${label})` : ''; }
+
+  // Archive source label
+  const archiveSrc = data.archive_count > 0
+    ? `Archive-validated (${data.archive_count} runs)`
+    : 'Proxy (KB-derived)';
+
+  // KPI tiles
+  document.getElementById('kpi-precision').textContent   = pct(data.precision);
+  document.getElementById('kpi-recall').textContent      = pct(data.recall);
+  document.getElementById('kpi-f1').textContent          = pct(data.f1);
+  document.getElementById('kpi-accuracy').textContent    = pct(data.accuracy);
+  document.getElementById('kpi-ec-accuracy').textContent = pct(data.ec_accuracy);
+  document.getElementById('kpi-rca-count').textContent   = data.rca_count ?? '0';
+
+  // Update sub-labels with data source
+  ['kpi-precision-src', 'kpi-recall-src', 'kpi-f1-src', 'kpi-accuracy-src'].forEach(id => {
+    const el = document.getElementById(id);
+    if (el) {
+      el.innerHTML = el.textContent + ` <span class="badge-src">${archiveSrc}</span>`;
+    }
+  });
+  const rcaSrcEl = document.getElementById('kpi-rca-src');
+  if (rcaSrcEl) {
+    rcaSrcEl.innerHTML = `RCA KB entries &amp; ${data.archive_count ?? 0} archive runs`;
+  }
+
+  // Data note
+  const noteEl = document.getElementById('data-note');
+  if (data.data_note) {
+    noteEl.textContent = data.data_note;
+  } else {
+    noteEl.textContent =
+      `Based on ${data.rca_count ?? 0} RCA KB entries, ${data.archive_count ?? 0} archive diagnosis runs, ` +
+      `and ${data.feedback_count ?? 0} fix feedback entries.`;
+  }
+
+  // ── RCA + Fix Success Ratio section ──────────────────────────────────
+  const rfs = data.rca_fix_success || {};
+  const total = rfs.total_rca ?? 0;
+  document.getElementById('archive-count-label').textContent = total + ' archive';
+  document.getElementById('kpi-total-rca').textContent        = total || '—';
+  document.getElementById('kpi-high-conf-rate').textContent   =
+    rfs.high_confidence_count != null && total
+      ? pct(rfs.high_confidence_count / total)
+      : 'N/A';
+  document.getElementById('kpi-composite-success').textContent =
+    pct(rfs.composite_success_rate);
+
+  // Archive charts
+  renderRcaFixByType(rfs.by_error_type || []);
+  renderConfVsApplicabilityScatter(data.conf_vs_applicability);
+  renderConfidenceFactorsBar(data.confidence_factors);
+
+  // ── Human Feedback KPI tiles ─────────────────────────────────────────
+  const hf = data.human_feedback || {};
+  document.getElementById('kpi-hf-count').textContent    = hf.total_count ?? '0';
+  document.getElementById('kpi-hf-accept').textContent   = pct(hf.acceptance_rate);
+  document.getElementById('kpi-hf-rating').textContent   = hf.avg_rating != null ? Number(hf.avg_rating).toFixed(1) + ' ★' : 'N/A';
+  document.getElementById('kpi-hf-rcc').textContent      = pct(hf.root_cause_correct_rate);
+  document.getElementById('kpi-hf-resolved').textContent = pct(hf.resolved_issue_rate);
+
+  // ── Human Feedback Charts ─────────────────────────────────────────────
+  const ratingDist = hf.rating_distribution || {};
+  new Chart(document.getElementById('chart-hf-rating'), {
+    type: 'bar',
+    data: {
+      labels: ['1 ★', '2 ★', '3 ★', '4 ★', '5 ★'],
+      datasets: [{
+        label: 'Submissions',
+        data: [ratingDist[1]||0, ratingDist[2]||0, ratingDist[3]||0, ratingDist[4]||0, ratingDist[5]||0],
+        backgroundColor: ['#ef4444','#f97316','#eab308','#84cc16','#22c55e'],
+        borderRadius: 4,
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { display: false } },
+      scales: { y: { beginAtZero: true, ticks: { stepSize: 1 } } }
+    }
+  });
+
+  const cd = hf.correctness_distribution || {};
+  new Chart(document.getElementById('chart-hf-correctness'), {
+    type: 'doughnut',
+    data: {
+      labels: ['Yes', 'Partially', 'No'],
+      datasets: [{
+        data: [cd.yes||0, cd.partially||0, cd.no||0],
+        backgroundColor: ['#22c55e', '#eab308', '#ef4444'],
+        borderWidth: 1,
+      }]
+    },
+    options: {
+      responsive: true,
+      plugins: { legend: { position: 'bottom' } }
+    }
+  });
+
+  // ── Original evaluation charts ────────────────────────────────────────
+  renderConfidenceCalibration(data.calibration_curve);
+  renderPrecisionRecallCurve(data.pr_curve);
+  renderPerformanceByErrorType(data.performance_by_type);
+  renderKbHitRateTrend(data.kb_hit_rate_trend);
+  renderFixAcceptanceRate(data.fix_acceptance_rate);
+})();
+</script>
+{% endblock %}

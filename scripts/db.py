@@ -10,7 +10,7 @@ Entity / Schema Design
 =============================================================================
 
 Collection 1 — ci_failure_logs
-────────────────────────────────
+
 Purpose   : Stores chunked raw CI log text for semantic similarity retrieval.
 Embedding : sentence-transformers/all-MiniLM-L6-v2  (384-dim, L2-normalised)
 
@@ -35,7 +35,7 @@ Document attributes (ChromaDB metadata per vector):
   updated_at     TEXT      ISO-8601 UTC timestamp of last upsert
 
 Collection 2 — rca_knowledge_base
-───────────────────────────────────
+
 Purpose   : Stores (error_signature → RCA) pairs — the self-learning store.
 Embedding : Error signature text embedded via the same MiniLM model.
 
@@ -56,15 +56,15 @@ Self-Learning Loop
 ───────────────────
   CI failure
       │
-      ▼
+      V
   RCA Agent generates RCA
       │
-      ▼
-  kb.update(error_signature, rca_payload)      ← auto-called after every RCA
-      │  ├── embeds signature (MiniLM 384-dim)
-      │  ├── upserts into ChromaDB collection
-      │  └── persists to JSON sidecar (atomic tmp-rename)
-      ▼
+      V
+  kb.update(error_signature, rca_payload) - auto-called after every RCA
+      │  --> embeds signature (MiniLM 384-dim)
+      │  --> upserts into ChromaDB collection
+      │  --> persists to JSON sidecar (atomic tmp-rename)
+      V
   Next similar failure → kb.search() returns this RCA as high-similarity hit
   (no model call needed if similarity ≥ KB_CONFIDENCE_THRESHOLD = 0.70)
 =============================================================================
@@ -539,7 +539,7 @@ class SelfLearningKnowledgeBase:
                 "generated_at":    utc_now(),
             })],
         )
-        # Preserve existing hit_count when overwriting an entry
+        # Preserve existing hit_count and validation_results when overwriting an entry
         existing = self._rca_repository.get(error_signature, {})
         self._rca_repository[error_signature] = {
             "rca_summary":           rca_payload.get("rca_summary", ""),
@@ -551,9 +551,64 @@ class SelfLearningKnowledgeBase:
             "inline_fix_suggestions":rca_payload.get("inline_fix_suggestions", []),
             "generated_at":          utc_now(),
             "hit_count":             existing.get("hit_count", 0),
+            # Preserve any validation results recorded by the validation pipeline
+            "validation_results":    existing.get("validation_results", []),
         }
         self._save_kv()
         logger.debug("KB updated — signature=%s", error_signature)
+
+    def update_validation_result(
+        self,
+        error_signature: str,
+        fix_rank: int,
+        result: dict[str, Any],
+    ) -> None:
+        """
+        Append a validation result to the per-entry ``validation_results`` list
+        in ``rca_repository.json``.
+
+        Called by the automated validation pipeline (Track B) after a live
+        validation run completes (success or failure).
+
+        Parameters
+        ----------
+        error_signature : str
+            Human-readable error signature matching an existing KB entry.
+        fix_rank : int
+            Which fix (1–5) was validated.
+        result : dict
+            Validation result dict.  Must contain at minimum ``validation_type``
+            and ``status``.  Expected structure::
+
+                {
+                    "fix_rank":       int,
+                    "validation_type": "live",
+                    "status":         "live_pass" | "live_fail" | "queued" | "error",
+                    "run_id":         str | None,
+                    "pr_url":         str | None,
+                    "log_excerpt":    str | None,
+                    "validated_at":   str,  # ISO-8601 UTC
+                }
+        """
+        entry = self._rca_repository.get(error_signature)
+        if entry is None:
+            logger.warning(
+                "update_validation_result: no KB entry for signature=%s — skipping",
+                error_signature,
+            )
+            return
+
+        if "validation_results" not in entry:
+            entry["validation_results"] = []
+
+        # Stamp fix_rank and validated_at into the result before appending
+        stamped = {**result, "fix_rank": fix_rank, "validated_at": utc_now()}
+        entry["validation_results"].append(stamped)
+        self._save_kv()
+        logger.info(
+            "Validation result recorded — signature=%s  fix_rank=%d  status=%s",
+            error_signature, fix_rank, result.get("status", "unknown"),
+        )
 
     def best_confidence(self, entries: list[RCAEntry]) -> float:
         """Return the highest similarity score from a search result list."""
